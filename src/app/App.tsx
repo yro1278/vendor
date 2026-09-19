@@ -1,38 +1,13 @@
-import { useState } from "react";
-import SupplierPortal, { SupplierLogin } from "./SupplierPortal";
-
-const SESSION_KEY = "trim_vendor_supplier_session";
+import VendorManagement, { VendorLogin } from "./VendorModule";
+import { useAdminSession, useVendorData } from "./vendor-data";
 
 export default function App() {
-  const [session, setSession] = useState<string | null>(() => {
-    try {
-      return localStorage.getItem(SESSION_KEY);
-    } catch {
-      return null;
-    }
-  });
+  const { data, actions } = useVendorData();
+  const [isAdmin, setAdmin] = useAdminSession();
 
-  const handleLogin = (id: string) => {
-    try {
-      localStorage.setItem(SESSION_KEY, id);
-    } catch {
-      /* ignore */
-    }
-    setSession(id);
-  };
-
-  const handleLogout = () => {
-    try {
-      localStorage.removeItem(SESSION_KEY);
-    } catch {
-      /* ignore */
-    }
-    setSession(null);
-  };
-
-  if (!session) {
-    return <SupplierLogin onLogin={handleLogin} />;
+  if (!isAdmin) {
+    return <VendorLogin onLogin={() => setAdmin(true)} />;
   }
 
-  return <SupplierPortal supplierId={session} onLogout={handleLogout} />;
+  return <VendorManagement data={data} actions={actions} onLogout={() => setAdmin(false)} />;
 }
