@@ -1,0 +1,24 @@
+{
+  "name": "trim-vendor-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env src/index.js",
+    "start": "node --env-file-if-exists=.env src/index.js",
+    "setup": "node --env-file-if-exists=.env src/setup.js",
+    "test": "node test/validate-receipt.test.mjs && node test/validate-request.test.mjs",
+    "test:integration": "node test/api-integration.test.mjs"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.4.0",
+    "mysql2": "^3.12.0"
+  }
+}

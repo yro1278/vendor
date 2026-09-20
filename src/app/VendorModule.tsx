@@ -5,13 +5,17 @@ import {
   LogOut, Menu, X, Eye, Search, ChevronDown, ChevronLeft, ChevronRight, Plus, Save, Trash2,
   Clock, Truck, Boxes, ClipboardList, AlertTriangle, AlertCircle, Info, RefreshCw, Lock,
   CheckCircle2, CheckCircle, XCircle, PackageOpen, Users, Mail, Phone, MapPin, FileText, ArrowLeft,
+  ClipboardPlus, Send, CalendarClock,
 } from "lucide-react";
 import {
   Supplier, SupplyReceipt, ReceiptItem, ReceiptCondition, SupplyStatus, AppNotification,
   UNIT_OPTIONS, SUPPLY_STATUS_CFG, CONDITION_LABEL,
   genId, fmtDate, fmtDateTime, arrivalReceivedQty, arrivalHasIssue, receiptHasIssue,
   supplierReceivedQty, VendorData, VendorActions,
+  RequestPriority, SupplyRequest, SupplyRequestStatus, SupplyRequestInput,
+  REQUEST_PRIORITIES, REQUEST_PRIORITY_LABEL, REQUEST_STATUS_CFG,
 } from "./vendor-data";
+import { api, ApiError, setToken, type CompanyProfile } from "./api";
 
 /* ─────────────────────────────────────────────────────────
    TRI-M GLOBAL LOGISTICS & TRADING INC. — VENDOR MANAGEMENT
@@ -20,7 +24,7 @@ import {
    subsystem. No supplier recruiting / sourcing happens here.
    ───────────────────────────────────────────────────────── */
 
-type Page = "dashboard" | "receiving" | "monitor" | "suppliers" | "history" | "notifications" | "company";
+type Page = "dashboard" | "receiving" | "monitor" | "request" | "suppliers" | "history" | "notifications" | "company";
 
 const inp = "w-full min-h-[44px] px-3.5 py-2.5 text-[15px] sm:text-sm border border-slate-200 rounded-xl bg-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#5b21b6]/20 focus:border-[#5b21b6]/40 transition-colors";
 const selectCls = `${inp} cursor-pointer appearance-none`;
@@ -77,6 +81,32 @@ const ReceiptStatusPill = ({ rec }: { rec: SupplyReceipt }) =>
     ? <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold rounded-full border bg-red-50 text-red-700 border-red-200"><AlertTriangle size={12} /> Rejected / Damaged</span>
     : <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold rounded-full border bg-green-50 text-green-700 border-green-200"><CheckCircle2 size={12} /> Received</span>;
 
+const RequestStatusBadge = ({ status }: { status: SupplyRequestStatus }) => {
+  const c = REQUEST_STATUS_CFG[status];
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold rounded-full border ${c.cls}`}>
+      <span className={`w-1.5 h-1.5 rounded-full ${c.dot}`} />{c.label}
+    </span>
+  );
+};
+
+const PriorityPill = ({ priority }: { priority: RequestPriority }) => {
+  const m: Record<RequestPriority, string> = {
+    low: "bg-slate-50 text-slate-600 border-slate-200",
+    normal: "bg-sky-50 text-sky-700 border-sky-200",
+    high: "bg-amber-50 text-amber-700 border-amber-200",
+    urgent: "bg-red-50 text-red-700 border-red-200",
+  };
+  return <span className={`inline-flex items-center px-2 py-0.5 text-xs font-semibold rounded-full border ${m[priority]}`}>{REQUEST_PRIORITY_LABEL[priority]}</span>;
+};
+
+const FulfillmentTag = ({ progress }: { progress: SupplyRequest["fulfillment"]["progress"] }) =>
+  progress === "fulfilled"
+    ? <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-full border bg-green-50 text-green-700 border-green-200"><CheckCircle2 size={11} /> Full</span>
+    : progress === "partial"
+      ? <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-full border bg-orange-50 text-orange-700 border-orange-200"><RefreshCw size={11} /> Partial</span>
+      : <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-full border bg-slate-50 text-slate-500 border-slate-200">Pending</span>;
+
 const KpiCard = ({ icon, label, value, sub, color }: { icon: React.ReactNode; label: string; value: React.ReactNode; sub?: string; color: string }) => (
   <Card className="p-5 card-hover">
     <div className="flex items-center justify-between gap-3">
@@ -127,19 +157,30 @@ const Modal = ({ open, onClose, title, children, footer, maxW = "max-w-[640px]" 
 
 /* ── sign in ───────────────────────────────────────────── */
 
-export const VendorLogin = ({ onLogin }: { onLogin: () => void }) => {
+export const VendorLogin = ({ onLogin, notice }: { onLogin: () => void; notice?: string }) => {
   const [username, setUsername] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [error, setError] = React.useState("");
   const [loading, setLoading] = React.useState(false);
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (username === "admin" && password === "admin123") {
-      setLoading(true);
-      setTimeout(() => { onLogin(); setLoading(false); }, 400);
-    } else {
-      setError("Invalid username or password. Try the demo credentials below.");
+    if (loading || !username || !password) return;
+    setLoading(true);
+    setError("");
+    try {
+      const res = await api.login(username.trim(), password);
+      setToken(res.token);
+      onLogin();
+    } catch (err) {
+      const offline = err instanceof ApiError && err.status === 0;
+      if (offline) {
+        setError("Cannot reach the vendor server. Check that the MySQL backend is running.");
+      } else {
+        setError("Invalid username or password. Try the demo credentials below.");
+      }
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -164,6 +205,7 @@ export const VendorLogin = ({ onLogin }: { onLogin: () => void }) => {
               <input type="password" className={inp} value={password} onChange={e => { setPassword(e.target.value); setError(""); }} placeholder="••••••••" autoComplete="current-password" />
             </Field>
             {error && <div className="bg-red-50 border border-red-200 rounded-xl p-3 flex gap-2 text-xs text-red-600"><AlertCircle size={14} className="shrink-0" />{error}</div>}
+            {notice && <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 flex gap-2 text-xs text-amber-700"><AlertCircle size={14} className="shrink-0" />{notice}</div>}
             <Btn type="submit" className="w-full" disabled={loading || !username || !password}>
               {loading ? <><RefreshCw size={15} className="animate-spin" /> Signing in…</> : <><Lock size={15} /> Sign In</>}
             </Btn>
@@ -184,6 +226,7 @@ const NAV: { icon: React.ReactNode; label: string; page: Page }[] = [
   { icon: <LayoutDashboard size={17} />, label: "Dashboard", page: "dashboard" },
   { icon: <PackagePlus size={17} />, label: "Receiving", page: "receiving" },
   { icon: <PackageSearch size={17} />, label: "Supply Monitoring", page: "monitor" },
+  { icon: <ClipboardPlus size={17} />, label: "Request Supply", page: "request" },
   { icon: <Building2 size={17} />, label: "Suppliers", page: "suppliers" },
   { icon: <ClipboardList size={17} />, label: "Receiving History", page: "history" },
   { icon: <Bell size={17} />, label: "Notifications", page: "notifications" },
@@ -193,11 +236,13 @@ const NAV: { icon: React.ReactNode; label: string; page: Page }[] = [
 type Props = {
   data: VendorData;
   actions: VendorActions;
+  loading?: boolean;
+  error?: string | null;
   onLogout: () => void;
 };
 
 export default function VendorManagement(props: Props) {
-  const { data, actions, onLogout } = props;
+  const { data, actions, loading = false, error = null, onLogout } = props;
   const [page, setPage] = React.useState<Page>("dashboard");
   const [mobileOpen, setMobileOpen] = React.useState(false);
   const [collapsed, setCollapsed] = React.useState(false);
@@ -275,15 +320,33 @@ export default function VendorManagement(props: Props) {
           </div>
         </header>
         <main className="flex-1 overflow-y-auto p-4 sm:p-6">
-          <div key={page} className="page-enter mx-auto max-w-[1440px]">
-            {page === "dashboard" && <Dashboard data={data} goTo={toNext} startReceiving={startReceiving} />}
-            {page === "receiving" && <Receiving data={data} actions={actions} target={receiptTarget} onTargetConsumed={() => setReceiptTarget(null)} goTo={toNext} />}
-            {page === "monitor" && <SupplyMonitoring data={data} actions={actions} startReceiving={startReceiving} goTo={toNext} />}
-            {page === "suppliers" && <Suppliers data={data} actions={actions} />}
-            {page === "history" && <ReceivingHistory data={data} />}
-            {page === "notifications" && <Notifications data={data} actions={actions} />}
-            {page === "company" && <CompanyProfile />}
-          </div>
+          {loading ? (
+            <div className="max-w-[1440px] mx-auto">
+              <Card className="p-12 text-center">
+                <RefreshCw size={26} className="text-[#5b21b6] mx-auto mb-3 animate-spin" />
+                <p className="text-sm font-semibold text-slate-600">Loading vendor data…</p>
+                <p className="text-xs text-slate-400 mt-1">Retrieving suppliers, expected supplies, and receiving records from the database.</p>
+              </Card>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {error && (
+                <div className="max-w-[1440px] mx-auto bg-red-50 border border-red-200 rounded-xl p-3 flex gap-2 text-xs text-red-600">
+                  <AlertTriangle size={14} className="shrink-0 mt-0.5" />{error}
+                </div>
+              )}
+              <div key={page} className="page-enter mx-auto max-w-[1440px]">
+                {page === "dashboard" && <Dashboard data={data} goTo={toNext} startReceiving={startReceiving} />}
+                {page === "receiving" && <Receiving data={data} actions={actions} target={receiptTarget} onTargetConsumed={() => setReceiptTarget(null)} goTo={toNext} />}
+                {page === "monitor" && <SupplyMonitoring data={data} actions={actions} startReceiving={startReceiving} goTo={toNext} />}
+                {page === "request" && <RequestSupply data={data} actions={actions} goTo={toNext} />}
+                {page === "suppliers" && <Suppliers data={data} actions={actions} />}
+                {page === "history" && <ReceivingHistory data={data} />}
+                {page === "notifications" && <Notifications data={data} actions={actions} />}
+                {page === "company" && <CompanyProfile profile={data.profile} />}
+              </div>
+            </div>
+          )}
         </main>
         <div id="modal-portal" />
       </div>
@@ -294,7 +357,7 @@ export default function VendorManagement(props: Props) {
 /* ── dashboard ─────────────────────────────────────────── */
 
 const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p: Page) => void; startReceiving: (id?: string) => void }) => {
-  const { arrivals, receipts, suppliers } = data;
+  const { arrivals, receipts, suppliers, supplyRequests } = data;
   const count = (s: SupplyStatus) => arrivals.filter(a => a.status === s).length;
   const expected = count("expected");
   const forReceiving = count("for_receiving");
@@ -302,6 +365,11 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
   const received = count("received");
   const completed = count("completed");
   const rejected = count("rejected_damaged");
+
+  const pendingRequests = supplyRequests.filter(r => ["submitted", "under_review", "approved", "processing", "fulfillment_in_progress"].includes(r.status)).length;
+  const underReview = supplyRequests.filter(r => r.status === "under_review").length;
+  const fulfilledRequests = supplyRequests.filter(r => r.status === "fulfilled").length;
+  const partialRequests = supplyRequests.filter(r => r.status === "partially_fulfilled").length;
 
   const recentReceipts = [...receipts].sort((a, b) => +new Date(b.receivedAt) - +new Date(a.receivedAt)).slice(0, 5);
   const recentNotifs = data.notifications.slice(0, 4);
@@ -331,6 +399,13 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
         <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Received" value={partial} sub="Balance pending" color="bg-orange-50" />
         <KpiCard icon={<PackageCheck size={18} className="text-indigo-600" />} label="Completed Receiving" value={completed} sub="Closed & forwarded" color="bg-indigo-50" />
         <KpiCard icon={<AlertTriangle size={18} className="text-red-600" />} label="Issues / Damaged" value={rejected} sub={rejected > 0 ? "Needs attention" : "No issues"} color="bg-red-50" />
+      </div>
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <KpiCard icon={<ClipboardPlus size={18} className="text-violet-600" />} label="Requests In Progress" value={pendingRequests} sub="Submitted → Fulfillment" color="bg-violet-50" />
+        <KpiCard icon={<Clock size={18} className="text-amber-600" />} label="Under Review" value={underReview} sub="With Supply Chain" color="bg-amber-50" />
+        <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Fulfilled" value={partialRequests} sub="Balance pending" color="bg-orange-50" />
+        <KpiCard icon={<CheckCircle2 size={18} className="text-green-600" />} label="Requests Fulfilled" value={fulfilledRequests} sub="Fully delivered" color="bg-green-50" />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
@@ -434,6 +509,422 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
   );
 };
 
+/* ── request supply ────────────────────────────────────── */
+
+type RequestItemEditorRow = { productId: number | ""; qty: number; unit: string; remarks: string };
+
+const emptyRequestItem = (): RequestItemEditorRow => ({ productId: "", qty: 1, unit: "pcs", remarks: "" });
+
+const localTodayValue = () => {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+const toDateInput = (iso: string) => {
+  const s = (iso ?? "").slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : "";
+};
+
+const RequestForm = ({ open, onClose, editing, data, actions }: {
+  open: boolean;
+  onClose: () => void;
+  editing: SupplyRequest | null;
+  data: VendorData;
+  actions: VendorActions;
+}) => {
+  const [neededByDate, setNeededByDate] = React.useState("");
+  const [priority, setPriority] = React.useState<RequestPriority>("normal");
+  const [reason, setReason] = React.useState("");
+  const [remarks, setRemarks] = React.useState("");
+  const [items, setItems] = React.useState<RequestItemEditorRow[]>([emptyRequestItem()]);
+  const [err, setErr] = React.useState("");
+  const [fieldErr, setFieldErr] = React.useState<Record<string, string>>({});
+  const [saving, setSaving] = React.useState(false);
+
+  const productById = React.useMemo(() => new Map(data.products.map(p => [p.id, p])), [data.products]);
+
+  React.useEffect(() => {
+    if (!open) return;
+    if (editing) {
+      setNeededByDate(toDateInput(editing.neededByDate) || localTodayValue());
+      setPriority(editing.priority);
+      setReason(editing.reason);
+      setRemarks(editing.remarks);
+      setItems(editing.items.map(i => ({ productId: i.productId ?? "", qty: i.qty, unit: i.unit, remarks: i.remarks })));
+    } else {
+      setNeededByDate(localTodayValue());
+      setPriority("normal");
+      setReason("");
+      setRemarks("");
+      setItems([emptyRequestItem()]);
+    }
+    setErr("");
+    setFieldErr({});
+    setSaving(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editing]);
+
+  const validate = (): { message: string; fields: Record<string, string> } | null => {
+    const fields: Record<string, string> = {};
+    if (!neededByDate) fields.neededByDate = "Needed-by date is required.";
+    if (items.length === 0) fields.items = "Add at least one requested supply item.";
+    else {
+      const seen = new Set<string>();
+      for (const it of items) {
+        if (it.productId === "" || !productById.has(String(it.productId))) { fields.items = "Each item needs a product selected from the product database."; break; }
+        const q = Number(it.qty);
+        if (!Number.isFinite(q) || q <= 0) { fields.items = "Each item quantity must be greater than zero."; break; }
+        if (!it.unit.trim()) { fields.items = "Each item needs a unit."; break; }
+        const key = `${String(it.productId)}::${it.unit}`;
+        if (seen.has(key)) { fields.items = "Duplicate product in the same request is not allowed."; break; }
+        seen.add(key);
+      }
+    }
+    if (Object.keys(fields).length === 0) return null;
+    return { message: fields[Object.keys(fields)[0]], fields };
+  };
+
+  const buildInput = (): SupplyRequestInput => ({
+    neededByDate,
+    priority,
+    reason: reason.trim(),
+    remarks: remarks.trim(),
+    items: items.map(it => ({
+      productId: Number(it.productId),
+      qty: Number(it.qty),
+      unit: it.unit.trim(),
+      remarks: it.remarks.trim(),
+    })),
+  });
+
+  const handleSave = async (submitAfter: boolean) => {
+    setErr("");
+    setFieldErr({});
+    const v = validate();
+    if (v) { setFieldErr(v.fields); setErr(v.message); return; }
+
+    setSaving(true);
+    try {
+      const res = editing
+        ? await actions.updateSupplyRequest(editing.id, buildInput())
+        : await actions.createSupplyRequest(buildInput());
+      if (!res.ok) {
+        setFieldErr(mapFieldErrors(res.errors));
+        setErr(res.error ?? "Failed to save the supply request.");
+        return;
+      }
+      onClose();
+      if (submitAfter && res.id) void actions.submitSupplyRequest(res.id);
+    } catch {
+      setErr("Failed to save the supply request.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title={`${editing ? `Edit Supply Request · ${editing.id}` : "New Supply Request"}`} maxW="max-w-[760px]"
+      footer={
+        <div className="flex flex-col gap-3">
+          {err && <div className="bg-red-50 border border-red-200 rounded-xl p-3 flex gap-2 text-xs text-red-600"><AlertCircle size={14} className="shrink-0" />{err}</div>}
+          <div className="flex flex-wrap gap-3 justify-end">
+            <Btn variant="secondary" size="sm" onClick={onClose}>Cancel</Btn>
+            <Btn variant="secondary" size="sm" onClick={() => handleSave(false)} disabled={saving}>{saving ? <RefreshCw size={14} className="animate-spin" /> : <Save size={14} />} Save Draft</Btn>
+            <Btn size="sm" onClick={() => handleSave(true)} disabled={saving}><Send size={14} /> {saving ? "Saving…" : "Save & Submit Request"}</Btn>
+          </div>
+        </div>
+      }>
+      <div className="space-y-5">
+        <div className="bg-violet-50 border border-violet-200 rounded-xl p-3 flex gap-2 text-xs text-violet-700"><Info size={14} className="shrink-0 mt-0.5" /> This request tells the Supply Chain subsystem what supplies Tri-M needs. Supplier sourcing, selection, and procurement are managed by Supply Chain — not here.</div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Field label="Request Reference" hint="Assigned automatically by the backend">
+            <input className={`${inp} bg-slate-50 text-slate-500`} value={editing?.id ?? "VR-YYYY-NNNN"} disabled />
+          </Field>
+          <Field label="Requested By" hint="Authenticated user — cannot be changed">
+            <input className={`${inp} bg-slate-50 text-slate-500`} value="Administrator" disabled />
+          </Field>
+          <Field label="Request Date" hint="Assigned automatically by the backend">
+            <input className={`${inp} bg-slate-50 text-slate-500`} value={editing ? fmtDateTime(editing.requestDate) : fmtDateTime(new Date().toISOString())} disabled />
+          </Field>
+          <Field label="Needed By Date" required error={fieldErr.neededByDate}>
+            <div className="relative">
+              <input type="date" className={`${inp} pr-9`} value={neededByDate} onChange={e => setNeededByDate(e.target.value)} />
+              <CalendarClock size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+            </div>
+          </Field>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Field label="Priority" required>
+            <div className="relative">
+              <select className={selectCls} value={priority} onChange={e => setPriority(e.target.value as RequestPriority)}>
+                {REQUEST_PRIORITIES.map(p => <option key={p} value={p}>{REQUEST_PRIORITY_LABEL[p]}</option>)}
+              </select>
+              <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+            </div>
+          </Field>
+          <Field label="Reason / Purpose" required error={fieldErr.reason}>
+            <input className={inp} value={reason} onChange={e => setReason(e.target.value)} placeholder="Why is this supply needed?" />
+          </Field>
+        </div>
+
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-sm font-semibold text-slate-700">Requested Items — Product / Quantity / Unit</p>
+            <button onClick={() => setItems([...items, emptyRequestItem()])} className="text-xs font-semibold text-violet-600 hover:text-violet-800 flex items-center gap-1"><Plus size={12} /> Add Item</button>
+          </div>
+          <div className="space-y-2">
+            {items.map((it, idx) => (
+              <div key={idx} className="grid grid-cols-1 sm:grid-cols-[1.4fr_0.6fr_0.7fr_auto] gap-2 p-3 rounded-xl border border-slate-100 bg-slate-50/60">
+                <div className="relative">
+                  <select className={selectCls} value={it.productId} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, productId: e.target.value ? Number(e.target.value) : "" } : x))}>
+                    <option value="">— Select product —</option>
+                    {data.products.map(p => (
+                      <option key={p.id} value={p.id}>{p.name}{p.brand ? ` · ${p.brand}` : ""}</option>
+                    ))}
+                  </select>
+                  <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                </div>
+                <input type="number" min={1} className={inp} value={it.qty} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, qty: Number(e.target.value) } : x))} placeholder="Qty" />
+                <div className="relative">
+                  <select className={selectCls} value={it.unit} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, unit: e.target.value } : x))}>
+                    {UNIT_OPTIONS.map(u => <option key={u} value={u}>{u}</option>)}
+                  </select>
+                  <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                </div>
+                <div className="flex gap-1">
+                  <input className={`${inp} sm:w-full`} value={it.remarks} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, remarks: e.target.value } : x))} placeholder="Item remarks (optional)" />
+                  <button onClick={() => setItems(items.filter((_, i) => i !== idx))} disabled={items.length === 1} className="p-2 rounded-lg hover:bg-white border border-transparent hover:border-slate-200 text-slate-400 hover:text-red-600 disabled:opacity-30 shrink-0"><Trash2 size={14} /></button>
+                </div>
+              </div>
+            ))}
+          </div>
+          {fieldErr.items && <p className="text-xs text-red-600 mt-2">{fieldErr.items}</p>}
+          <div className="flex justify-end mt-3 text-sm"><span className="text-slate-500">Total items: <strong className="text-slate-800">{items.length}</strong></span></div>
+        </div>
+
+        <div>
+          <Field label="Remarks (optional)" hint="Additional notes for the Supply Chain team">
+            <textarea className={`${inp} min-h-[76px]`} value={remarks} onChange={e => setRemarks(e.target.value)} placeholder="Optional notes…" />
+          </Field>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+const RequestDetail = ({ request, onClose, onEdit, actions }: {
+  request: SupplyRequest;
+  onClose: () => void;
+  onEdit: () => void;
+  actions: VendorActions;
+}) => {
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState("");
+
+  const run = async (fn: (id: string) => Promise<{ ok: boolean; error?: string }>, id: string, msg: string) => {
+    setBusy(true);
+    setErr("");
+    const res = await fn(id);
+    setBusy(false);
+    if (!res.ok) setErr(res.error ?? msg);
+  };
+
+  const line = (k: string, v: React.ReactNode, i: React.ReactNode) => (
+    <div className="flex gap-3 py-3 border-b border-slate-100 last:border-0">
+      <div className="text-slate-400 mt-0.5">{i}</div>
+      <div className="flex-1 grid grid-cols-1 sm:grid-cols-[150px_1fr] gap-1">
+        <p className="text-[11px] uppercase tracking-wide font-semibold text-slate-400">{k}</p>
+        <p className="text-sm text-slate-700 break-words">{v}</p>
+      </div>
+    </div>
+  );
+
+  const full = request.fulfillment.progress === "fulfilled";
+  const partial = request.fulfillment.progress === "partial";
+
+  return (
+    <Modal open={!!request} onClose={onClose} title={`Supply Request · ${request.id}`} maxW="max-w-[720px]"
+      footer={
+        <div className="flex flex-col gap-3">
+          {err && <div className="bg-red-50 border border-red-200 rounded-xl p-3 flex gap-2 text-xs text-red-600"><AlertCircle size={14} className="shrink-0" />{err}</div>}
+          <div className="flex flex-wrap gap-3 justify-end">
+            <Btn variant="secondary" size="sm" onClick={onClose}>Close</Btn>
+            {request.status === "draft" && <Btn variant="secondary" size="sm" onClick={onEdit} disabled={busy}><Save size={13} /> Edit Draft</Btn>}
+            {request.status === "draft" && <Btn size="sm" onClick={() => { if (confirm(`Submit ${request.id} to the Supply Chain subsystem?`)) run(actions.submitSupplyRequest, request.id, "Failed to submit the request."); }} disabled={busy}><Send size={13} /> Submit Request</Btn>}
+            {(request.status === "draft" || request.status === "submitted") && <Btn variant="danger" size="sm" onClick={() => { if (confirm(`Cancel ${request.id}?`)) run(actions.cancelSupplyRequest, request.id, "Failed to cancel the request."); }} disabled={busy}><XCircle size={13} /> Cancel Request</Btn>}
+          </div>
+        </div>
+      }>
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2"><MonoId id={request.id} /><RequestStatusBadge status={request.status} /></div>
+
+        {line("Request Date", fmtDateTime(request.requestDate), <CalendarClock size={14} />)}
+        {line("Requested By", "Administrator (authenticated user)", <Users size={14} />)}
+        {line("Needed By Date", fmtDate(request.neededByDate), <CalendarClock size={14} />)}
+        {line("Priority", <PriorityPill priority={request.priority} />, <AlertTriangle size={14} />)}
+        {line("Reason / Purpose", request.reason || "—", <FileText size={14} />)}
+        {line("Remarks", request.remarks || "—", <Info size={14} />)}
+        {request.submittedAt && line("Submitted", fmtDateTime(request.submittedAt), <Send size={14} />)}
+
+        <div>
+          <p className="text-sm font-bold text-slate-700 mb-2">Request Items</p>
+          <div className="overflow-x-auto border border-slate-200 rounded-xl">
+            <table className="w-full min-w-[520px]">
+              <thead>
+                <tr className="text-xs font-bold text-slate-500 uppercase tracking-wide border-b border-slate-100 bg-slate-50/60">
+                  <th className="text-left px-4 py-2">Product</th>
+                  <th className="text-right px-4 py-2">Requested</th>
+                  <th className="text-right px-4 py-2">Fulfilled</th>
+                  <th className="text-right px-4 py-2">Remaining</th>
+                </tr>
+              </thead>
+              <tbody>
+                {request.items.map((it) => {
+                  const fl = request.fulfillment.items.find(f => f.productName === it.productName && f.unit === it.unit);
+                  const requested = fl?.requestedQty ?? it.qty;
+                  const fulfilled = fl?.fulfilledQty ?? 0;
+                  const remaining = fl?.remainingQty ?? Math.max(0, requested);
+                  return (
+                    <tr key={it.id} className="border-b border-slate-100 last:border-0">
+                      <td className="px-4 py-2.5"><p className="text-sm font-semibold text-slate-700">{it.productName}</p>{it.remarks && <p className="text-[11px] text-slate-400 mt-0.5">{it.remarks}</p>}</td>
+                      <td className="px-4 py-2.5 text-right text-sm text-slate-800">{requested.toLocaleString()} {it.unit}</td>
+                      <td className="px-4 py-2.5 text-right text-sm font-semibold text-green-700">{fulfilled.toLocaleString()}</td>
+                      <td className="px-4 py-2.5 text-right text-sm">{remaining <= 0 ? <span className="text-slate-400">0</span> : <span className="font-semibold text-amber-700">{remaining.toLocaleString()}</span>}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {partial && <p className="text-xs text-orange-600 mt-2 flex items-center gap-1"><RefreshCw size={12} /> Partially fulfilled — remaining quantities are pending from Supply Chain.</p>}
+          {full && <p className="text-xs text-green-700 mt-2 flex items-center gap-1"><CheckCircle2 size={12} /> All requested quantities have been fulfilled.</p>}
+          {!partial && !full && <p className="text-xs text-slate-400 mt-2">Fulfillment is derived from receiving records once Supply Chain schedules deliveries.</p>}
+        </div>
+
+        {(request.scReference || request.supplierName || request.processingStatus || request.expectedDeliveryDate) && (
+          <div className="bg-sky-50 border border-sky-200 rounded-xl p-3">
+            <p className="text-[11px] uppercase tracking-wide font-semibold text-sky-700 mb-2 flex items-center gap-1"><Info size={12} /> Supply Chain Information</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs text-slate-700">
+              {request.scReference && <div className="flex gap-2"><span className="text-slate-400">SC Reference:</span><MonoId id={request.scReference} /></div>}
+              {request.processingStatus && <div className="flex gap-2"><span className="text-slate-400">Processing:</span><span className="font-semibold capitalize">{request.processingStatus}</span></div>}
+              {request.supplierName && <div className="flex gap-2"><span className="text-slate-400">Supplier:</span><strong>{request.supplierName}</strong></div>}
+              {request.expectedDeliveryDate && <div className="flex gap-2"><span className="text-slate-400">Expected Delivery:</span>{fmtDate(request.expectedDeliveryDate)}</div>}
+            </div>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+};
+
+const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: VendorActions; goTo: (p: Page) => void }) => {
+  const [filter, setFilter] = React.useState<SupplyRequestStatus | "all">("all");
+  const [q, setQ] = React.useState("");
+  const [formOpen, setFormOpen] = React.useState(false);
+  const [editing, setEditing] = React.useState<SupplyRequest | null>(null);
+  const [viewing, setViewing] = React.useState<SupplyRequest | null>(null);
+
+  const STATUSES: SupplyRequestStatus[] = ["draft", "submitted", "under_review", "approved", "processing", "fulfillment_in_progress", "partially_fulfilled", "fulfilled", "rejected", "cancelled"];
+
+  const filtered = data.supplyRequests.filter(r => {
+    const matchF = filter === "all" || r.status === filter;
+    const qq = q.toLowerCase();
+    const matchQ = !qq || r.id.toLowerCase().includes(qq) || r.reason.toLowerCase().includes(qq) || r.items.some(i => i.productName.toLowerCase().includes(qq));
+    return matchF && matchQ;
+  }).sort((a, b) => +new Date(b.requestDate) - +new Date(a.requestDate));
+
+  const pendingCount = (s: SupplyRequestStatus) => data.supplyRequests.filter(r => r.status === s).length;
+
+  return (
+    <div className="space-y-5">
+      <Card className="p-4 flex flex-col sm:flex-row gap-3">
+        <div className="relative flex-1">
+          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input className={`${inp} pl-9`} placeholder="Search request ref, reason, or product…" value={q} onChange={e => setQ(e.target.value)} />
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button onClick={() => setFilter("all")} className={`px-3 py-1.5 text-xs font-semibold rounded-full border transition-colors ${filter === "all" ? "bg-[#5b21b6] text-white border-[#5b21b6]" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"}`}>All ({data.supplyRequests.length})</button>
+          {STATUSES.map(s => (
+            <button key={s} onClick={() => setFilter(s)} className={`px-3 py-1.5 text-xs font-semibold rounded-full border transition-colors ${filter === s ? "bg-[#5b21b6] text-white border-[#5b21b6]" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"}`}>{REQUEST_STATUS_CFG[s].label} ({pendingCount(s)})</button>
+          ))}
+        </div>
+        <Btn className="shrink-0" onClick={() => { setEditing(null); setFormOpen(true); }}><Plus size={15} /> Create Request</Btn>
+      </Card>
+
+      <Card>
+        <div className="hidden lg:block">
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[960px]">
+              <thead>
+                <tr className="text-xs font-bold text-slate-500 uppercase tracking-wide border-b border-slate-100 bg-slate-50/60">
+                  <th className="text-left px-4 py-3">Request Reference</th>
+                  <th className="text-left px-4 py-3">Requested</th>
+                  <th className="text-left px-4 py-3">Items</th>
+                  <th className="text-left px-4 py-3">Needed By</th>
+                  <th className="text-left px-4 py-3">Priority</th>
+                  <th className="text-left px-4 py-3">Fulfillment</th>
+                  <th className="text-left px-4 py-3">Status</th>
+                  <th className="text-right px-4 py-3">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map(r => (
+                  <tr key={r.id} className="border-b border-slate-100 hover:bg-slate-50/60">
+                    <td className="px-4 py-3"><MonoId id={r.id} />{r.submittedAt && <p className="text-[11px] text-slate-400 mt-0.5">Submitted {fmtDate(r.submittedAt)}</p>}</td>
+                    <td className="px-4 py-3 text-xs text-slate-600 whitespace-nowrap">{fmtDate(r.requestDate)}</td>
+                    <td className="px-4 py-3 text-xs text-slate-600 max-w-[240px]"><p className="truncate">{r.items.map(i => i.productName).join(", ")}</p>{r.items.length > 1 && <p className="text-[11px] text-slate-400">{r.items.length} items</p>}</td>
+                    <td className="px-4 py-3 text-xs text-slate-600 whitespace-nowrap">{fmtDate(r.neededByDate)}</td>
+                    <td className="px-4 py-3"><PriorityPill priority={r.priority} /></td>
+                    <td className="px-4 py-3"><FulfillmentTag progress={r.fulfillment.progress} /><p className="text-[11px] text-slate-400 mt-0.5">{r.fulfillment.items.reduce((a, f) => a + f.fulfilledQty, 0).toLocaleString()} / {r.fulfillment.items.reduce((a, f) => a + f.requestedQty, 0).toLocaleString()} {r.items[0]?.unit ?? ""}</p></td>
+                    <td className="px-4 py-3"><RequestStatusBadge status={r.status} /></td>
+                    <td className="px-4 py-3"><div className="flex justify-end gap-1">
+                      <button onClick={() => setViewing({ ...r })} className="p-2 rounded-lg hover:bg-slate-50 border border-transparent hover:border-slate-200 text-slate-600 hover:text-violet-700" title="View details"><Eye size={14} /></button>
+                      {r.status === "draft" && <button onClick={() => { setEditing({ ...r }); setFormOpen(true); }} className="p-2 rounded-lg hover:bg-slate-50 border border-transparent hover:border-slate-200 text-slate-600 hover:text-violet-700" title="Edit draft"><Save size={14} /></button>}
+                    </div></td>
+                  </tr>
+                ))}
+                {filtered.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-sm text-slate-400">No supply requests found. Click "Create Request" to request supplies from the Supply Chain subsystem.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 lg:hidden">
+          {filtered.map(r => (
+            <Card key={r.id} className="p-4">
+              <div className="flex items-start justify-between gap-2 mb-2">
+                <div><MonoId id={r.id} /><p className="text-sm font-bold text-slate-800 mt-1">{fmtDate(r.requestDate)}</p></div>
+                <RequestStatusBadge status={r.status} />
+              </div>
+              <div className="space-y-1 text-xs text-slate-600 mb-3">
+                <div className="flex gap-2"><PackageOpen size={12} className="text-slate-400 mt-0.5" />{r.items.map(i => i.productName).join(", ")}</div>
+                <div className="flex gap-2"><CalendarClock size={12} className="text-slate-400 mt-0.5" />Needed by {fmtDate(r.neededByDate)}</div>
+                <div className="flex gap-2"><AlertTriangle size={12} className="text-slate-400 mt-0.5" /><PriorityPill priority={r.priority} /></div>
+              </div>
+              <Btn size="sm" variant="secondary" className="w-full" onClick={() => setViewing({ ...r })}><Eye size={12} /> View Details</Btn>
+            </Card>
+          ))}
+          {filtered.length === 0 && <Card className="p-8 text-center col-span-full text-sm text-slate-400">No supply requests found.</Card>}
+        </div>
+      </Card>
+
+      <RequestForm open={formOpen} onClose={() => setFormOpen(false)} editing={editing} data={data} actions={actions} />
+
+      {viewing && (
+        <RequestDetail
+          request={viewing}
+          onClose={() => setViewing(null)}
+          onEdit={() => { const draft = viewing; setViewing(null); setEditing(draft); setFormOpen(true); }}
+          actions={actions}
+        />
+      )}
+    </div>
+  );
+};
+
 /* ── receiving form helpers ────────────────────────────── */
 
 const localNowValue = () => {
@@ -448,6 +939,26 @@ const toLocalInput = (iso: string) => {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 };
+
+const MAP_BACKEND_FIELDS: Record<string, string> = {
+  supplier_reference: "docRef",
+  supplier_id: "items",
+  received_at: "receivedAt",
+  received_by: "receivedBy",
+  remarks: "remarks",
+  items: "items",
+};
+
+const mapFieldErrors = (errors?: Record<string, string>): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(errors ?? {})) {
+    const f = MAP_BACKEND_FIELDS[k];
+    if (f && !out[f]) out[f] = v;
+  }
+  return out;
+};
+
+const COUNT_UNITS = new Set(["pcs", "box", "case", "sack", "bag", "pack", "pallet"]);
 
 const emptyItem = (): ReceiptItem => ({ productName: "", qty: 1, unit: "pcs", condition: "good" });
 
@@ -464,10 +975,12 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
   const [docRef, setDocRef] = React.useState<string>("");
   const [remarks, setRemarks] = React.useState("");
   const [err, setErr] = React.useState("");
+  const [saving, setSaving] = React.useState(false);
+  const [fieldErr, setFieldErr] = React.useState<Record<string, string>>({});
 
   const reset = () => {
     setArrivalId(""); setSupplierId(""); setItems([emptyItem()]); setReceivedAt(localNowValue());
-    setReceivingBy("R. Dela Cruz"); setDocRef(""); setRemarks(""); setErr("");
+    setReceivingBy("R. Dela Cruz"); setDocRef(""); setRemarks(""); setErr(""); setFieldErr({}); setSaving(false);
   };
 
   const applyArrival = (id: string) => {
@@ -501,25 +1014,63 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
   const supplier = data.suppliers.find(s => s.id === supplierId) ?? null;
   const totalQty = items.reduce((a, i) => a + (Number(i.qty) || 0), 0);
 
-  const handleSave = () => {
+  const validate = (): { message: string; fields: Record<string, string> } | null => {
+    const fields: Record<string, string> = {};
+
+    if (!supplierId) fields.items = "Choose a supplier or link an expected supply first.";
+    if (!docRef.trim()) fields.docRef = "Supplier reference is required before confirming the receiving record.";
+    if (!receivedAt || isNaN(+new Date(receivedAt))) fields.receivedAt = "Received date/time is required before confirming the receiving record.";
+    if (!receivingBy.trim()) fields.receivedBy = "Received by is required before confirming the receiving record.";
+    if (!remarks.trim()) fields.remarks = "Remarks are required before confirming the receiving record.";
+
+    if (items.length === 0) fields.items = "Add at least one product line with a valid quantity.";
+    else {
+      for (const it of items) {
+        if (!it.productName.trim()) { fields.items = "Each item needs a product name."; break; }
+        const q = Number(it.qty);
+        if (!Number.isFinite(q) || q <= 0) { fields.items = "Each item quantity must be greater than zero."; break; }
+        if (COUNT_UNITS.has(it.unit) && !Number.isInteger(q)) { fields.items = `Quantity must be a whole number for "${it.unit}" units.`; break; }
+      }
+    }
+
+    if (Object.keys(fields).length === 0) return null;
+    return { message: fields[Object.keys(fields)[0]], fields };
+  };
+
+  const handleSave = async () => {
     setErr("");
-    if (!supplierId) { setErr("Choose a supplier or link an expected supply first."); return; }
-    if (items.length === 0 || items.some(i => !i.productName.trim() || (Number(i.qty) || 0) <= 0)) { setErr("Add at least one product line with a valid quantity."); return; }
+    setFieldErr({});
+    const v = validate();
+    if (v) { setFieldErr(v.fields); setErr(v.message); return; }
+
     const rec: SupplyReceipt = {
       id: editing?.id ?? genId("RR"),
       arrivalId: arrival ? arrival.id : "",
       supplierId,
       supplierName: supplier?.companyName ?? supplierId,
-      items: items.map(i => ({ ...i, qty: Number(i.qty) || 0 })),
+      items: items.map(i => ({ ...i, qty: Number(i.qty) })),
       totalQty,
       receivedAt: new Date(receivedAt).toISOString(),
-      receivingBy: receivingBy.trim() || "—",
-      docRef: docRef.trim() || "—",
+      receivingBy: receivingBy.trim(),
+      docRef: docRef.trim(),
       remarks: remarks.trim(),
     };
-    actions.recordReceipt(rec);
-    reset();
-    onSaved();
+
+    setSaving(true);
+    try {
+      const res = await actions.recordReceipt(rec);
+      if (!res.ok) {
+        setFieldErr(mapFieldErrors(res.errors));
+        setErr(res.error ?? "Failed to save the receiving record.");
+        return;
+      }
+      reset();
+      onSaved();
+    } catch {
+      setErr("Failed to save the receiving record.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -527,7 +1078,7 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
       footer={
         <div className="flex flex-col gap-3">
           {err && <div className="bg-red-50 border border-red-200 rounded-xl p-3 flex gap-2 text-xs text-red-600"><AlertCircle size={14} className="shrink-0" />{err}</div>}
-          <div className="flex gap-3 justify-end"><Btn variant="secondary" size="sm" onClick={onClose}>Cancel</Btn><Btn size="sm" onClick={handleSave}><Save size={14} /> {editing ? "Save Changes" : "Record Receiving"}</Btn></div>
+          <div className="flex gap-3 justify-end"><Btn variant="secondary" size="sm" onClick={onClose}>Cancel</Btn><Btn size="sm" onClick={handleSave} disabled={saving}>{saving ? <RefreshCw size={14} className="animate-spin" /> : <Save size={14} />} {saving ? "Saving…" : editing ? "Save Changes" : "Record Receiving"}</Btn></div>
         </div>
       }>
       <div className="space-y-5">
@@ -593,12 +1144,12 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Received Date & Time" required><input type="datetime-local" className={inp} value={receivedAt} onChange={e => setReceivedAt(e.target.value)} /></Field>
-          <Field label="Received By" required><input className={inp} value={receivingBy} onChange={e => setReceivingBy(e.target.value)} placeholder="Receiving personnel" /></Field>
+          <Field label="Received Date & Time" required error={fieldErr.receivedAt}><input type="datetime-local" className={inp} value={receivedAt} onChange={e => setReceivedAt(e.target.value)} /></Field>
+          <Field label="Received By" required error={fieldErr.receivedBy}><input className={inp} value={receivingBy} onChange={e => setReceivingBy(e.target.value)} placeholder="Receiving personnel" /></Field>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Document / Reference No." hint="Delivery receipt, waybill, invoice…"><input className={inp} value={docRef} onChange={e => setDocRef(e.target.value)} placeholder="e.g. DR-2026-1234" /></Field>
-          <Field label="Remarks"><input className={inp} value={remarks} onChange={e => setRemarks(e.target.value)} placeholder="Condition, notes, follow-ups…" /></Field>
+          <Field label="Document / Reference No." required error={fieldErr.docRef} hint="Delivery receipt, waybill, invoice…"><input className={inp} value={docRef} onChange={e => setDocRef(e.target.value)} placeholder="e.g. DR-2026-1234" /></Field>
+          <Field label="Remarks" required error={fieldErr.remarks}><input className={inp} value={remarks} onChange={e => setRemarks(e.target.value)} placeholder="Condition, notes, follow-ups…" /></Field>
         </div>
       </div>
     </Modal>
@@ -1112,8 +1663,10 @@ const Notifications = ({ data, actions }: { data: VendorData; actions: VendorAct
 };
 
 /* ── company profile ───────────────────────────────────── */
+/* Company identity comes from the vendors table via the backend
+   (GET /api/vendor/company) — not hardcoded in the frontend. */
 
-const CompanyProfile = () => {
+const CompanyProfile = ({ profile }: { profile: CompanyProfile | null }) => {
   const steps = [
     { t: "Supply Chain Subsystem", d: "Finds & sources suppliers, coordinates and acquires supply.", c: "bg-sky-50 text-sky-700 border-sky-200" },
     { t: "Supplier & Supply Info", d: "Supplier records and supply schedules passed downstream.", c: "bg-violet-50 text-violet-700 border-violet-200" },
@@ -1123,17 +1676,22 @@ const CompanyProfile = () => {
     { t: "Inventory / Stock Monitoring", d: "Forwarded received supply for stock monitoring downstream.", c: "bg-slate-100 text-slate-700 border-slate-200" },
   ];
 
+  const companyName = profile?.companyName ?? "Tri-M Global Logistics & Trading Inc.";
+  const address = profile?.address ?? "Main Distribution Center (MDC), North Harbor, Manila";
+  const email = profile?.contactEmail ?? "vendor@trimi-global.ph";
+  const phone = profile?.contactPhone ?? "+63 2 8888 0000";
+
   return (
     <div className="space-y-5">
       <Card className="p-6 flex flex-col sm:flex-row gap-5 items-start sm:items-center">
         <div className="w-16 h-16 rounded-2xl bg-[#5b21b6] text-white flex items-center justify-center shrink-0"><Boxes size={30} /></div>
         <div className="flex-1">
-          <h1 className="text-lg font-bold text-slate-800">Tri-M Global Logistics &amp; Trading Inc.</h1>
+          <h1 className="text-lg font-bold text-slate-800">{companyName}</h1>
           <p className="text-xs text-slate-400 mt-0.5">Vendor Management Module — Supply receiving &amp; monitoring</p>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 mt-3 text-xs text-slate-600">
-            <div className="flex gap-2"><MapPin size={12} className="text-slate-400 mt-0.5 shrink-0" />Main Distribution Center (MDC), North Harbor, Manila</div>
-            <div className="flex gap-2"><Mail size={12} className="text-slate-400 mt-0.5 shrink-0" />vendor@trimi-global.ph</div>
-            <div className="flex gap-2"><Phone size={12} className="text-slate-400 mt-0.5 shrink-0" />+63 2 8888 0000</div>
+            <div className="flex gap-2"><MapPin size={12} className="text-slate-400 mt-0.5 shrink-0" />{address}</div>
+            <div className="flex gap-2"><Mail size={12} className="text-slate-400 mt-0.5 shrink-0" />{email}</div>
+            <div className="flex gap-2"><Phone size={12} className="text-slate-400 mt-0.5 shrink-0" />{phone}</div>
             <div className="flex gap-2"><Building2 size={12} className="text-slate-400 mt-0.5 shrink-0" />Logistics &amp; Trading</div>
           </div>
         </div>

@@ -1,0 +1,16 @@
+import mysql from "mysql2/promise";
+const c = await mysql.createConnection({ host: "127.0.0.1", port: 3306, user: "root", database: "tri_m_vendor" });
+const q = (sql) => c.query(sql);
+const [vendors] = await q("SELECT id, company_name, is_active FROM vendors");
+const [users] = await q("SELECT id, username, role, vendor_id FROM users");
+const [tables] = await q(`SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='tri_m_vendor' AND TABLE_NAME IN ('vendors','audit_logs','revoked_tokens','company_documents')`);
+const [col] = await q(`SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='tri_m_vendor' AND TABLE_NAME='users' AND COLUMN_NAME='vendor_id'`);
+const [s] = await q("SELECT COUNT(*) c FROM suppliers");
+const [fix] = await q("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='tri_m_vendor' AND TABLE_NAME='receipts' AND COLUMN_NAME='vendor_id'");
+const [arrfix] = await q("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='tri_m_vendor' AND TABLE_NAME='arrivals' AND COLUMN_NAME='supply_request_id' AND COLUMN_NAME='vendor_id'");
+console.log("vendors:", JSON.stringify(vendors));
+console.log("users:", JSON.stringify(users));
+console.log("security tables:", tables.map(t => t.TABLE_NAME).join(","));
+console.log("users.vendor_id type:", col[0]?.COLUMN_TYPE);
+console.log("suppliers count:", s[0].c, "receipts.vendor_id:", fix.length, "arrivals.vendor_id:", arrfix.length);
+await c.end();
