@@ -16,6 +16,7 @@ import {
   REQUEST_PRIORITIES, REQUEST_PRIORITY_LABEL, REQUEST_STATUS_CFG,
 } from "./vendor-data";
 import { api, ApiError, setToken, type CompanyProfile } from "./api";
+import { usePagePersistence, useDraftPersistence, saveDraft, clearDraft, DraftType } from "./draft-persistence";
 
 /* ─────────────────────────────────────────────────────────
    TRI-M GLOBAL LOGISTICS & TRADING INC. — VENDOR MANAGEMENT
@@ -243,7 +244,7 @@ type Props = {
 
 export default function VendorManagement(props: Props) {
   const { data, actions, loading = false, error = null, onLogout } = props;
-  const [page, setPage] = React.useState<Page>("dashboard");
+  const [page, setPage, pageLoaded] = usePagePersistence<Page>("dashboard");
   const [mobileOpen, setMobileOpen] = React.useState(false);
   const [collapsed, setCollapsed] = React.useState(false);
   const [receiptTarget, setReceiptTarget] = React.useState<string | null>(null);
@@ -513,6 +514,14 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
 
 type RequestItemEditorRow = { productId: number | ""; qty: number; unit: string; remarks: string };
 
+type RequestFormDraft = {
+  neededByDate: string;
+  priority: RequestPriority;
+  reason: string;
+  remarks: string;
+  items: RequestItemEditorRow[];
+};
+
 const emptyRequestItem = (): RequestItemEditorRow => ({ productId: "", qty: 1, unit: "pcs", remarks: "" });
 
 const localTodayValue = () => {
@@ -526,6 +535,14 @@ const toDateInput = (iso: string) => {
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : "";
 };
 
+const initialRequestDraft = (): RequestFormDraft => ({
+  neededByDate: localTodayValue(),
+  priority: "normal",
+  reason: "",
+  remarks: "",
+  items: [emptyRequestItem()],
+});
+
 const RequestForm = ({ open, onClose, editing, data, actions }: {
   open: boolean;
   onClose: () => void;
@@ -533,11 +550,7 @@ const RequestForm = ({ open, onClose, editing, data, actions }: {
   data: VendorData;
   actions: VendorActions;
 }) => {
-  const [neededByDate, setNeededByDate] = React.useState("");
-  const [priority, setPriority] = React.useState<RequestPriority>("normal");
-  const [reason, setReason] = React.useState("");
-  const [remarks, setRemarks] = React.useState("");
-  const [items, setItems] = React.useState<RequestItemEditorRow[]>([emptyRequestItem()]);
+  const [draft, setDraft, draftLoaded] = useDraftPersistence<RequestFormDraft>("request", initialRequestDraft(), editing?.id ?? "new");
   const [err, setErr] = React.useState("");
   const [fieldErr, setFieldErr] = React.useState<Record<string, string>>({});
   const [saving, setSaving] = React.useState(false);
@@ -545,33 +558,31 @@ const RequestForm = ({ open, onClose, editing, data, actions }: {
   const productById = React.useMemo(() => new Map(data.products.map(p => [p.id, p])), [data.products]);
 
   React.useEffect(() => {
-    if (!open) return;
+    if (!open || !draftLoaded) return;
     if (editing) {
-      setNeededByDate(toDateInput(editing.neededByDate) || localTodayValue());
-      setPriority(editing.priority);
-      setReason(editing.reason);
-      setRemarks(editing.remarks);
-      setItems(editing.items.map(i => ({ productId: i.productId ?? "", qty: i.qty, unit: i.unit, remarks: i.remarks })));
+      setDraft({
+        neededByDate: toDateInput(editing.neededByDate) || localTodayValue(),
+        priority: editing.priority,
+        reason: editing.reason,
+        remarks: editing.remarks,
+        items: editing.items.map(i => ({ productId: i.productId ?? "", qty: i.qty, unit: i.unit, remarks: i.remarks })),
+      });
     } else {
-      setNeededByDate(localTodayValue());
-      setPriority("normal");
-      setReason("");
-      setRemarks("");
-      setItems([emptyRequestItem()]);
+      setDraft(initialRequestDraft());
     }
     setErr("");
     setFieldErr({});
     setSaving(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, editing]);
+  }, [open, editing, draftLoaded]);
 
   const validate = (): { message: string; fields: Record<string, string> } | null => {
     const fields: Record<string, string> = {};
-    if (!neededByDate) fields.neededByDate = "Needed-by date is required.";
-    if (items.length === 0) fields.items = "Add at least one requested supply item.";
+    if (!draft.neededByDate) fields.neededByDate = "Needed-by date is required.";
+    if (draft.items.length === 0) fields.items = "Add at least one requested supply item.";
     else {
       const seen = new Set<string>();
-      for (const it of items) {
+      for (const it of draft.items) {
         if (it.productId === "" || !productById.has(String(it.productId))) { fields.items = "Each item needs a product selected from the product database."; break; }
         const q = Number(it.qty);
         if (!Number.isFinite(q) || q <= 0) { fields.items = "Each item quantity must be greater than zero."; break; }
@@ -586,11 +597,11 @@ const RequestForm = ({ open, onClose, editing, data, actions }: {
   };
 
   const buildInput = (): SupplyRequestInput => ({
-    neededByDate,
-    priority,
-    reason: reason.trim(),
-    remarks: remarks.trim(),
-    items: items.map(it => ({
+    neededByDate: draft.neededByDate,
+    priority: draft.priority,
+    reason: draft.reason.trim(),
+    remarks: draft.remarks.trim(),
+    items: draft.items.map(it => ({
       productId: Number(it.productId),
       qty: Number(it.qty),
       unit: it.unit.trim(),
@@ -614,6 +625,7 @@ const RequestForm = ({ open, onClose, editing, data, actions }: {
         setErr(res.error ?? "Failed to save the supply request.");
         return;
       }
+      clearDraft("request", editing?.id ?? "new");
       onClose();
       if (submitAfter && res.id) void actions.submitSupplyRequest(res.id);
     } catch {
@@ -650,7 +662,7 @@ const RequestForm = ({ open, onClose, editing, data, actions }: {
           </Field>
           <Field label="Needed By Date" required error={fieldErr.neededByDate}>
             <div className="relative">
-              <input type="date" className={`${inp} pr-9`} value={neededByDate} onChange={e => setNeededByDate(e.target.value)} />
+              <input type="date" className={`${inp} pr-9`} value={draft.neededByDate} onChange={e => setDraft(d => ({ ...d, neededByDate: e.target.value }))} />
               <CalendarClock size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
             </div>
           </Field>
@@ -659,27 +671,27 @@ const RequestForm = ({ open, onClose, editing, data, actions }: {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Field label="Priority" required>
             <div className="relative">
-              <select className={selectCls} value={priority} onChange={e => setPriority(e.target.value as RequestPriority)}>
+              <select className={selectCls} value={draft.priority} onChange={e => setDraft(d => ({ ...d, priority: e.target.value as RequestPriority }))}>
                 {REQUEST_PRIORITIES.map(p => <option key={p} value={p}>{REQUEST_PRIORITY_LABEL[p]}</option>)}
               </select>
               <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
             </div>
           </Field>
           <Field label="Reason / Purpose" required error={fieldErr.reason}>
-            <input className={inp} value={reason} onChange={e => setReason(e.target.value)} placeholder="Why is this supply needed?" />
+            <input className={inp} value={draft.reason} onChange={e => setDraft(d => ({ ...d, reason: e.target.value }))} placeholder="Why is this supply needed?" />
           </Field>
         </div>
 
         <div>
           <div className="flex items-center justify-between mb-2">
             <p className="text-sm font-semibold text-slate-700">Requested Items — Product / Quantity / Unit</p>
-            <button onClick={() => setItems([...items, emptyRequestItem()])} className="text-xs font-semibold text-violet-600 hover:text-violet-800 flex items-center gap-1"><Plus size={12} /> Add Item</button>
+            <button onClick={() => setDraft(d => ({ ...d, items: [...d.items, emptyRequestItem()] }))} className="text-xs font-semibold text-violet-600 hover:text-violet-800 flex items-center gap-1"><Plus size={12} /> Add Item</button>
           </div>
           <div className="space-y-2">
-            {items.map((it, idx) => (
+            {draft.items.map((it, idx) => (
               <div key={idx} className="grid grid-cols-1 sm:grid-cols-[1.4fr_0.6fr_0.7fr_auto] gap-2 p-3 rounded-xl border border-slate-100 bg-slate-50/60">
                 <div className="relative">
-                  <select className={selectCls} value={it.productId} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, productId: e.target.value ? Number(e.target.value) : "" } : x))}>
+                  <select className={selectCls} value={it.productId} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, productId: e.target.value ? Number(e.target.value) : "" } : x) }))}>
                     <option value="">— Select product —</option>
                     {data.products.map(p => (
                       <option key={p.id} value={p.id}>{p.name}{p.brand ? ` · ${p.brand}` : ""}</option>
@@ -687,27 +699,27 @@ const RequestForm = ({ open, onClose, editing, data, actions }: {
                   </select>
                   <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
                 </div>
-                <input type="number" min={1} className={inp} value={it.qty} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, qty: Number(e.target.value) } : x))} placeholder="Qty" />
+                <input type="number" min={1} className={inp} value={it.qty} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, qty: Number(e.target.value) } : x) }))} placeholder="Qty" />
                 <div className="relative">
-                  <select className={selectCls} value={it.unit} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, unit: e.target.value } : x))}>
+                  <select className={selectCls} value={it.unit} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, unit: e.target.value } : x) }))}>
                     {UNIT_OPTIONS.map(u => <option key={u} value={u}>{u}</option>)}
                   </select>
                   <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
                 </div>
                 <div className="flex gap-1">
-                  <input className={`${inp} sm:w-full`} value={it.remarks} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, remarks: e.target.value } : x))} placeholder="Item remarks (optional)" />
-                  <button onClick={() => setItems(items.filter((_, i) => i !== idx))} disabled={items.length === 1} className="p-2 rounded-lg hover:bg-white border border-transparent hover:border-slate-200 text-slate-400 hover:text-red-600 disabled:opacity-30 shrink-0"><Trash2 size={14} /></button>
+                  <input className={`${inp} sm:w-full`} value={it.remarks} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, remarks: e.target.value } : x) }))} placeholder="Item remarks (optional)" />
+                  <button onClick={() => setDraft(d => ({ ...d, items: d.items.filter((_, i) => i !== idx) }))} disabled={draft.items.length === 1} className="p-2 rounded-lg hover:bg-white border border-transparent hover:border-slate-200 text-slate-400 hover:text-red-600 disabled:opacity-30 shrink-0"><Trash2 size={14} /></button>
                 </div>
               </div>
             ))}
           </div>
           {fieldErr.items && <p className="text-xs text-red-600 mt-2">{fieldErr.items}</p>}
-          <div className="flex justify-end mt-3 text-sm"><span className="text-slate-500">Total items: <strong className="text-slate-800">{items.length}</strong></span></div>
+          <div className="flex justify-end mt-3 text-sm"><span className="text-slate-500">Total items: <strong className="text-slate-800">{draft.items.length}</strong></span></div>
         </div>
 
         <div>
           <Field label="Remarks (optional)" hint="Additional notes for the Supply Chain team">
-            <textarea className={`${inp} min-h-[76px]`} value={remarks} onChange={e => setRemarks(e.target.value)} placeholder="Optional notes…" />
+            <textarea className={`${inp} min-h-[76px]`} value={draft.remarks} onChange={e => setDraft(d => ({ ...d, remarks: e.target.value }))} placeholder="Optional notes…" />
           </Field>
         </div>
       </div>
@@ -911,7 +923,7 @@ const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: Ven
         </div>
       </Card>
 
-      <RequestForm open={formOpen} onClose={() => setFormOpen(false)} editing={editing} data={data} actions={actions} />
+      <RequestForm open={formOpen} onClose={() => { clearDraft("request", editing?.id ?? "new"); setFormOpen(false); }} editing={editing} data={data} actions={actions} />
 
       {viewing && (
         <RequestDetail
@@ -962,70 +974,93 @@ const COUNT_UNITS = new Set(["pcs", "box", "case", "sack", "bag", "pack", "palle
 
 const emptyItem = (): ReceiptItem => ({ productName: "", qty: 1, unit: "pcs", condition: "good" });
 
+type ReceiptFormDraft = {
+  arrivalId: string;
+  supplierId: string;
+  items: ReceiptItem[];
+  receivedAt: string;
+  receivingBy: string;
+  docRef: string;
+  remarks: string;
+};
+
+const initialReceiptDraft = (): ReceiptFormDraft => ({
+  arrivalId: "",
+  supplierId: "",
+  items: [emptyItem()],
+  receivedAt: localNowValue(),
+  receivingBy: "R. Dela Cruz",
+  docRef: "",
+  remarks: "",
+});
+
 const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, onSaved }: {
   data: VendorData; actions: VendorActions; open: boolean;
   editing: SupplyReceipt | null; targetArrivalId: string | null;
   onClose: () => void; onSaved: () => void;
 }) => {
-  const [arrivalId, setArrivalId] = React.useState<string>("");
-  const [supplierId, setSupplierId] = React.useState<string>("");
-  const [items, setItems] = React.useState<ReceiptItem[]>([emptyItem()]);
-  const [receivedAt, setReceivedAt] = React.useState(localNowValue());
-  const [receivingBy, setReceivingBy] = React.useState("R. Dela Cruz");
-  const [docRef, setDocRef] = React.useState<string>("");
-  const [remarks, setRemarks] = React.useState("");
+  const draftKey = editing?.id ?? targetArrivalId ?? "new";
+  const [draft, setDraft, draftLoaded] = useDraftPersistence<ReceiptFormDraft>("receiving", initialReceiptDraft(), draftKey);
   const [err, setErr] = React.useState("");
   const [saving, setSaving] = React.useState(false);
   const [fieldErr, setFieldErr] = React.useState<Record<string, string>>({});
 
-  const reset = () => {
-    setArrivalId(""); setSupplierId(""); setItems([emptyItem()]); setReceivedAt(localNowValue());
-    setReceivingBy("R. Dela Cruz"); setDocRef(""); setRemarks(""); setErr(""); setFieldErr({}); setSaving(false);
-  };
-
   const applyArrival = (id: string) => {
     const arr = data.arrivals.find(a => a.id === id);
-    setArrivalId(id);
-    setSupplierId(arr?.supplierId ?? "");
-    if (arr) {
-      setItems(arr.items.map(i => ({ productName: i.productName, qty: i.qty, unit: i.unit, condition: "good" as ReceiptCondition })));
-    } else {
-      setItems([emptyItem()]);
-    }
+    setDraft(d => ({
+      ...d,
+      arrivalId: id,
+      supplierId: arr?.supplierId ?? "",
+      items: arr ? arr.items.map(i => ({ productName: i.productName, qty: i.qty, unit: i.unit, condition: "good" as ReceiptCondition })) : [emptyItem()],
+    }));
   };
 
   React.useEffect(() => {
-    if (!open) return;
+    if (!open || !draftLoaded) return;
     if (editing) {
       const e = editing;
-      setArrivalId(e.arrivalId); setSupplierId(e.supplierId);
-      setItems(e.items.map(i => ({ ...i })));
-      setReceivedAt(toLocalInput(e.receivedAt)); setReceivingBy(e.receivingBy); setDocRef(e.docRef); setRemarks(e.remarks); setErr("");
+      setDraft({
+        arrivalId: e.arrivalId,
+        supplierId: e.supplierId,
+        items: e.items.map(i => ({ ...i })),
+        receivedAt: toLocalInput(e.receivedAt),
+        receivingBy: e.receivingBy,
+        docRef: e.docRef,
+        remarks: e.remarks,
+      });
     } else if (targetArrivalId) {
-      applyArrival(targetArrivalId);
-      setReceivedAt(localNowValue()); setReceivingBy("R. Dela Cruz"); setDocRef(""); setRemarks(""); setErr("");
+      const arr = data.arrivals.find(a => a.id === targetArrivalId);
+      setDraft({
+        ...initialReceiptDraft(),
+        arrivalId: targetArrivalId,
+        supplierId: arr?.supplierId ?? "",
+        items: arr ? arr.items.map(i => ({ productName: i.productName, qty: i.qty, unit: i.unit, condition: "good" as ReceiptCondition })) : [emptyItem()],
+      });
     } else {
-      reset();
+      setDraft(initialReceiptDraft());
     }
+    setErr("");
+    setFieldErr({});
+    setSaving(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, editing, targetArrivalId]);
+  }, [open, editing, targetArrivalId, draftLoaded]);
 
-  const arrival = data.arrivals.find(a => a.id === arrivalId) ?? null;
-  const supplier = data.suppliers.find(s => s.id === supplierId) ?? null;
-  const totalQty = items.reduce((a, i) => a + (Number(i.qty) || 0), 0);
+  const arrival = data.arrivals.find(a => a.id === draft.arrivalId) ?? null;
+  const supplier = data.suppliers.find(s => s.id === draft.supplierId) ?? null;
+  const totalQty = draft.items.reduce((a, i) => a + (Number(i.qty) || 0), 0);
 
   const validate = (): { message: string; fields: Record<string, string> } | null => {
     const fields: Record<string, string> = {};
 
-    if (!supplierId) fields.items = "Choose a supplier or link an expected supply first.";
-    if (!docRef.trim()) fields.docRef = "Supplier reference is required before confirming the receiving record.";
-    if (!receivedAt || isNaN(+new Date(receivedAt))) fields.receivedAt = "Received date/time is required before confirming the receiving record.";
-    if (!receivingBy.trim()) fields.receivedBy = "Received by is required before confirming the receiving record.";
-    if (!remarks.trim()) fields.remarks = "Remarks are required before confirming the receiving record.";
+    if (!draft.supplierId) fields.items = "Choose a supplier or link an expected supply first.";
+    if (!draft.docRef.trim()) fields.docRef = "Supplier reference is required before confirming the receiving record.";
+    if (!draft.receivedAt || isNaN(+new Date(draft.receivedAt))) fields.receivedAt = "Received date/time is required before confirming the receiving record.";
+    if (!draft.receivingBy.trim()) fields.receivedBy = "Received by is required before confirming the receiving record.";
+    if (!draft.remarks.trim()) fields.remarks = "Remarks are required before confirming the receiving record.";
 
-    if (items.length === 0) fields.items = "Add at least one product line with a valid quantity.";
+    if (draft.items.length === 0) fields.items = "Add at least one product line with a valid quantity.";
     else {
-      for (const it of items) {
+      for (const it of draft.items) {
         if (!it.productName.trim()) { fields.items = "Each item needs a product name."; break; }
         const q = Number(it.qty);
         if (!Number.isFinite(q) || q <= 0) { fields.items = "Each item quantity must be greater than zero."; break; }
@@ -1046,14 +1081,14 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
     const rec: SupplyReceipt = {
       id: editing?.id ?? genId("RR"),
       arrivalId: arrival ? arrival.id : "",
-      supplierId,
-      supplierName: supplier?.companyName ?? supplierId,
-      items: items.map(i => ({ ...i, qty: Number(i.qty) })),
+      supplierId: draft.supplierId,
+      supplierName: supplier?.companyName ?? draft.supplierId,
+      items: draft.items.map(i => ({ ...i, qty: Number(i.qty) })),
       totalQty,
-      receivedAt: new Date(receivedAt).toISOString(),
-      receivingBy: receivingBy.trim(),
-      docRef: docRef.trim(),
-      remarks: remarks.trim(),
+      receivedAt: new Date(draft.receivedAt).toISOString(),
+      receivingBy: draft.receivingBy.trim(),
+      docRef: draft.docRef.trim(),
+      remarks: draft.remarks.trim(),
     };
 
     setSaving(true);
@@ -1064,7 +1099,7 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
         setErr(res.error ?? "Failed to save the receiving record.");
         return;
       }
-      reset();
+      clearDraft("receiving", draftKey);
       onSaved();
     } catch {
       setErr("Failed to save the receiving record.");
@@ -1087,7 +1122,7 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Field label="Expected Supply (optional)" hint="Link to the SC delivery schedule being fulfilled">
             <div className="relative">
-              <select className={selectCls} value={arrivalId} onChange={e => { const v = e.target.value; if (v) applyArrival(v); else { setArrivalId(""); } }}>
+              <select className={selectCls} value={draft.arrivalId} onChange={e => { const v = e.target.value; if (v) applyArrival(v); else { setDraft(d => ({ ...d, arrivalId: "" })); } }}>
                 <option value="">— Ad-hoc receiving —</option>
                 {data.arrivals.filter(a => a.status !== "completed").map(a => <option key={a.id} value={a.id}>{a.id} · {a.supplierName}</option>)}
               </select>
@@ -1096,7 +1131,7 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
           </Field>
           <Field label="Supplier Reference" required>
             <div className="relative">
-              <select className={selectCls} value={supplierId} onChange={e => setSupplierId(e.target.value)} disabled={!!arrival}>
+              <select className={selectCls} value={draft.supplierId} onChange={e => setDraft(d => ({ ...d, supplierId: e.target.value }))} disabled={!!arrival}>
                 <option value="">— Choose supplier —</option>
                 {data.suppliers.filter(s => s.status === "active").map(s => <option key={s.id} value={s.id}>{s.companyName} · {s.id}</option>)}
               </select>
@@ -1117,26 +1152,26 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
         <div>
           <div className="flex items-center justify-between mb-2">
             <p className="text-sm font-semibold text-slate-700">Received Items — Quantity / Unit / Condition</p>
-            <button onClick={() => setItems([...items, emptyItem()])} className="text-xs font-semibold text-violet-600 hover:text-violet-800 flex items-center gap-1"><Plus size={12} /> Add item</button>
+            <button onClick={() => setDraft(d => ({ ...d, items: [...d.items, emptyItem()] }))} className="text-xs font-semibold text-violet-600 hover:text-violet-800 flex items-center gap-1"><Plus size={12} /> Add item</button>
           </div>
           <div className="space-y-2">
-            {items.map((it, idx) => (
+            {draft.items.map((it, idx) => (
               <div key={idx} className="grid grid-cols-1 sm:grid-cols-[2fr_0.6fr_0.7fr_auto_auto] gap-2 p-3 rounded-xl border border-slate-100 bg-slate-50/60">
-                <input className={inp} value={it.productName} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, productName: e.target.value } : x))} placeholder="Product / supply name" />
-                <input type="number" min={1} className={inp} value={it.qty} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, qty: Number(e.target.value) } : x))} placeholder="Qty" />
+                <input className={inp} value={it.productName} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, productName: e.target.value } : x) }))} placeholder="Product / supply name" />
+                <input type="number" min={1} className={inp} value={it.qty} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, qty: Number(e.target.value) } : x) }))} placeholder="Qty" />
                 <div className="relative">
-                  <select className={selectCls} value={it.unit} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, unit: e.target.value } : x))}>
+                  <select className={selectCls} value={it.unit} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, unit: e.target.value } : x) }))}>
                     {UNIT_OPTIONS.map(u => <option key={u} value={u}>{u}</option>)}
                   </select>
                   <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
                 </div>
                 <div className="relative">
-                  <select className={selectCls} value={it.condition} onChange={e => setItems(prev => prev.map((x, j) => j === idx ? { ...x, condition: e.target.value as ReceiptCondition } : x))}>
+                  <select className={selectCls} value={it.condition} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, condition: e.target.value as ReceiptCondition } : x) }))}>
                     {(Object.keys(CONDITION_LABEL) as ReceiptCondition[]).map(c => <option key={c} value={c}>{CONDITION_LABEL[c]}</option>)}
                   </select>
                   <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
                 </div>
-                <button onClick={() => setItems(items.filter((_, i) => i !== idx))} disabled={items.length === 1} className="p-2 rounded-lg hover:bg-white border border-transparent hover:border-slate-200 text-slate-400 hover:text-red-600 disabled:opacity-30"><Trash2 size={14} /></button>
+                <button onClick={() => setDraft(d => ({ ...d, items: d.items.filter((_, i) => i !== idx) }))} disabled={draft.items.length === 1} className="p-2 rounded-lg hover:bg-white border border-transparent hover:border-slate-200 text-slate-400 hover:text-red-600 disabled:opacity-30"><Trash2 size={14} /></button>
               </div>
             ))}
           </div>
@@ -1144,12 +1179,12 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Received Date & Time" required error={fieldErr.receivedAt}><input type="datetime-local" className={inp} value={receivedAt} onChange={e => setReceivedAt(e.target.value)} /></Field>
-          <Field label="Received By" required error={fieldErr.receivedBy}><input className={inp} value={receivingBy} onChange={e => setReceivingBy(e.target.value)} placeholder="Receiving personnel" /></Field>
+          <Field label="Received Date & Time" required error={fieldErr.receivedAt}><input type="datetime-local" className={inp} value={draft.receivedAt} onChange={e => setDraft(d => ({ ...d, receivedAt: e.target.value }))} /></Field>
+          <Field label="Received By" required error={fieldErr.receivedBy}><input className={inp} value={draft.receivingBy} onChange={e => setDraft(d => ({ ...d, receivingBy: e.target.value }))} placeholder="Receiving personnel" /></Field>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Document / Reference No." required error={fieldErr.docRef} hint="Delivery receipt, waybill, invoice…"><input className={inp} value={docRef} onChange={e => setDocRef(e.target.value)} placeholder="e.g. DR-2026-1234" /></Field>
-          <Field label="Remarks" required error={fieldErr.remarks}><input className={inp} value={remarks} onChange={e => setRemarks(e.target.value)} placeholder="Condition, notes, follow-ups…" /></Field>
+          <Field label="Document / Reference No." required error={fieldErr.docRef} hint="Delivery receipt, waybill, invoice…"><input className={inp} value={draft.docRef} onChange={e => setDraft(d => ({ ...d, docRef: e.target.value }))} placeholder="e.g. DR-2026-1234" /></Field>
+          <Field label="Remarks" required error={fieldErr.remarks}><input className={inp} value={draft.remarks} onChange={e => setDraft(d => ({ ...d, remarks: e.target.value }))} placeholder="Condition, notes, follow-ups…" /></Field>
         </div>
       </div>
     </Modal>
@@ -1250,7 +1285,7 @@ const Receiving = ({ data, actions, target, onTargetConsumed, goTo }: {
       <ReceiptForm
         data={data} actions={actions} open={formOpen}
         editing={editing} targetArrivalId={formTarget}
-        onClose={() => { setFormOpen(false); setEditing(null); setFormTarget(null); }}
+        onClose={() => { clearDraft("receiving", editing?.id ?? formTarget ?? "new"); setFormOpen(false); setEditing(null); setFormTarget(null); }}
         onSaved={() => { setFormOpen(false); setEditing(null); setFormTarget(null); }}
       />
     </div>
