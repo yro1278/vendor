@@ -6,13 +6,13 @@ import { asyncHandler, httpError } from "../util.js";
 import { requireRole } from "../auth.js";
 import { config } from "../config.js";
 import { generateReceivingReport, verifyReceivingReportPassword } from "../receiving-report.js";
+import { vendorIdOf } from "../store.js";
 import {
   approveApplication,
   cancelSupplyRequest,
   clearNotifications,
-  confirmReceipt,
-  createReceipt,
   createSupplyRequest,
+  createVendorReceiving,
   deleteCompanyDocument,
   fetchApplicationById,
   fetchApplicationDocument,
@@ -22,6 +22,7 @@ import {
   fetchCompanyDocument,
   fetchCompanyProfile,
   fetchDashboard,
+  fetchDeliveryDocument,
   fetchEvaluations,
   fetchPerformance,
   fetchReceiptById,
@@ -29,8 +30,12 @@ import {
   fetchSupplierById,
   fetchSupplyRequestById,
   fetchSupplyRequests,
+  fetchVendorReceivingById,
   insertCompanyDocument,
+  insertDeliveryDocument,
   listCompanyDocuments,
+  listDeliveryDocuments,
+  listVendorReceivings,
   markAllNotificationsRead,
   markNotificationRead,
   rejectApplication,
@@ -39,9 +44,7 @@ import {
   setApplicationUnderReview,
   setSupplierStatus,
   submitSupplyRequest,
-  updateArrivalStatus,
   updateCompanyProfile,
-  updateReceipt,
   updateSupplyRequest,
 } from "../store.js";
 
@@ -88,7 +91,7 @@ router.get(
   "/suppliers/:id",
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const supplier = await fetchSupplierById(req.params.id, actor(req));
+    const supplier = await fetchSupplierById(req.params.id, vendorIdOf(actor(req)));
     if (!supplier) throw httpError(404, "Supplier not found.");
     res.json(supplier);
   })
@@ -102,10 +105,26 @@ router.patch(
   })
 );
 
-router.patch(
-  "/arrivals/:id/status",
+router.get(
+  "/vendor-receivings",
   asyncHandler(async (req, res) => {
-    res.json(await updateArrivalStatus(req.params.id, req.body?.status, actor(req)));
+    res.json(await listVendorReceivings(actor(req), { arrivalId: req.query.arrivalId }));
+  })
+);
+
+router.get(
+  "/vendor-receivings/:id",
+  asyncHandler(async (req, res) => {
+    const record = await fetchVendorReceivingById(req.params.id, actor(req));
+    if (!record) throw httpError(404, "Vendor receiving record not found.");
+    res.json(record);
+  })
+);
+
+router.post(
+  "/arrivals/:arrivalId/vendor-receivings",
+  asyncHandler(async (req, res) => {
+    res.json(await createVendorReceiving(req.params.arrivalId, req.body ?? {}, actor(req)));
   })
 );
 
@@ -161,31 +180,9 @@ router.post(
 router.get(
   "/receiving/:id",
   asyncHandler(async (req, res) => {
-    const receipt = await fetchReceiptById(req.params.id, actor(req));
+    const receipt = await fetchReceiptById(req.params.id, vendorIdOf(actor(req)));
     if (!receipt) throw httpError(404, "Receiving transaction not found.");
     res.json(receipt);
-  })
-);
-
-router.post(
-  "/receiving",
-  asyncHandler(async (req, res) => {
-    const receipt = await createReceipt(req.body, actor(req));
-    res.status(201).json(receipt);
-  })
-);
-
-router.put(
-  "/receiving/:id",
-  asyncHandler(async (req, res) => {
-    res.json(await updateReceipt(req.params.id, req.body, actor(req)));
-  })
-);
-
-router.post(
-  "/receiving/:id/confirm",
-  asyncHandler(async (req, res) => {
-    res.json(await confirmReceipt(req.params.id, actor(req)));
   })
 );
 
@@ -369,6 +366,71 @@ router.delete(
     if (!doc) throw httpError(404, "Document not found.");
     await fsUnlink(join(UPLOAD_ROOT, doc.vendorId, doc.storedName)).catch(() => {});
     res.json(await deleteCompanyDocument(req.params.id, actor(req)));
+  })
+);
+
+/* ── Supply Chain delivery documents ─────────────────────
+   Documents attached to an SC delivery (SC-DLV-…) travel with the arrival
+   record. The Vendor Receiving form reads them from the linked delivery so
+   the vendor never retypes references or re-uploads SC documents. */
+
+const DELIVERY_DOC_ROOT = join(process.cwd(), "uploads", "deliveries");
+
+const deliveryUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, DELIVERY_DOC_ROOT),
+    filename: (_req, file, cb) => {
+      cb(null, `${Date.now()}-${randomUUID()}${extname(file.originalname).toLowerCase()}`);
+    },
+  }),
+  limits: { fileSize: MAX_DOC_BYTES, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    const name = file.originalname?.replace(/\0/g, "") ?? "";
+    const ext = extname(name).toLowerCase().replace(/^\./, "");
+    const allowedExt = ALLOWED_DOC_UPLOAD[file.mimetype] ?? [];
+    if (!allowedExt.includes(`.${ext}`)) {
+      return cb(new Error(`File type not allowed. Accepted types: ${Object.keys(ALLOWED_DOC_UPLOAD).join(", ")}.`));
+    }
+    cb(null, true);
+  },
+});
+
+router.get(
+  "/arrivals/:arrivalId/documents",
+  asyncHandler(async (req, res) => {
+    res.json(await listDeliveryDocuments(req.params.arrivalId, actor(req)));
+  })
+);
+
+/* Attach a document to an SC delivery. Admin-only: the SC side provides the
+   delivery documents; receiving staff read them, they don't upload them. */
+router.post(
+  "/arrivals/:arrivalId/documents",
+  requireRole("admin"),
+  deliveryUpload.single("file"),
+  asyncHandler(async (req, res) => {
+    const file = req.file;
+    if (!file) throw httpError(400, "No file was uploaded.");
+    const docDir = join(DELIVERY_DOC_ROOT, req.user.vendorId);
+    await fsMkdir(docDir);
+    await fsMove(file.path, join(docDir, file.filename));
+    res.status(201).json(await insertDeliveryDocument(req.params.arrivalId, file, actor(req)));
+  })
+);
+
+router.get(
+  "/arrivals/:arrivalId/documents/:docId/file",
+  asyncHandler(async (req, res) => {
+    const doc = await fetchDeliveryDocument(req.params.docId, actor(req));
+    if (!doc || doc.arrivalId !== req.params.arrivalId) throw httpError(404, "Document not found.");
+    const safeName = doc.name.replace(/[/\\]/g, "_").replace(/\0/g, "");
+    const filePath = join(DELIVERY_DOC_ROOT, req.user.vendorId, doc.storedName);
+    res.type(doc.mimeType);
+    res.setHeader(
+      "Content-Disposition",
+      req.query.download === "1" ? `attachment; filename="${safeName}"` : `inline; filename="${safeName}"`
+    );
+    res.sendFile(filePath);
   })
 );
 

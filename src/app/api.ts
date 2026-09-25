@@ -1,11 +1,15 @@
 import type {
   AppNotification,
+  DiscrepancyReport,
+  ReplacementRequest,
   SupplyArrival,
+  SupplyDeliveryDocument,
   SupplyReceipt,
   SupplyRequest,
   SupplyRequestInput,
   Supplier,
   SupplyStatus,
+  VendorReceiving,
 } from "./vendor-data";
 
 const TOKEN_KEY = "trim_vendor_admin_token";
@@ -21,6 +25,9 @@ export interface BootstrapData {
   notifications: AppNotification[];
   supplyRequests: SupplyRequest[];
   products: Product[];
+  replacementRequests: ReplacementRequest[];
+  vendorReceivings: VendorReceiving[];
+  discrepancyReports: DiscrepancyReport[];
 }
 
 export interface LoginResult {
@@ -101,7 +108,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     ...((init.headers as Record<string, string> | undefined) ?? {}),
   };
-  if (init.body) headers["Content-Type"] = "application/json";
+  if (init.body && !(init.body instanceof FormData)) headers["Content-Type"] = "application/json";
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
 
@@ -147,23 +154,34 @@ export const api = {
 
   bootstrap: () => request<BootstrapData>("/vendor/bootstrap"),
 
-  createReceipt: (rec: SupplyReceipt) =>
-    request<SupplyReceipt>("/vendor/receiving", {
-      method: "POST",
-      body: JSON.stringify(rec),
-    }),
+  /* Supply Chain delivery documents — the Record Received modal reads these
+     from the linked delivery; the vendor never re-uploads SC documents. */
+  listArrivalDocuments: (arrivalId: string) =>
+    request<SupplyDeliveryDocument[]>(`/vendor/arrivals/${encodeURIComponent(arrivalId)}/documents`),
 
-  updateReceipt: (rec: SupplyReceipt) =>
-    request<SupplyReceipt>(`/vendor/receiving/${encodeURIComponent(rec.id)}`, {
-      method: "PUT",
-      body: JSON.stringify(rec),
-    }),
-
-  updateArrivalStatus: (id: string, status: SupplyStatus) =>
-    request<{ ok: boolean }>(`/vendor/arrivals/${encodeURIComponent(id)}/status`, {
-      method: "PATCH",
-      body: JSON.stringify({ status }),
-    }),
+  /* Fetch a delivery-document file with the session token (plain <a> can't add
+     the Authorization header). The caller turns the blob into an in-app view
+     or download. */
+  fetchArrivalFile: async (arrivalId: string, docId: number): Promise<Blob> => {
+    const token = getToken();
+    let res: Response;
+    try {
+      res = await fetch(
+        `${API_BASE}/api/vendor/arrivals/${encodeURIComponent(arrivalId)}/documents/${docId}/file`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+    } catch {
+      throw new ApiError(0, "Cannot reach the vendor server. Check that the backend is running.");
+    }
+    if (!res.ok) {
+      if (res.status === 401) {
+        clearToken();
+        unauthorizedHandler?.();
+      }
+      throw new ApiError(res.status, `Failed to load document (${res.status}).`);
+    }
+    return res.blob();
+  },
 
   setSupplierStatus: (id: string, status: "active" | "inactive") =>
     request<{ ok: boolean }>(`/vendor/suppliers/${encodeURIComponent(id)}/status`, {
@@ -230,6 +248,25 @@ export const api = {
       body: JSON.stringify(body),
     });
   },
+
+  /* Vendor Receiving acknowledgments — the Vendor records receipt of ACCEPTED
+     stock; partial receiving stacks until the accepted quantity is covered. */
+  listVendorReceivings: (arrivalId?: string) => {
+    const q = arrivalId ? `?arrivalId=${encodeURIComponent(arrivalId)}` : "";
+    return request<VendorReceiving[]>(`/vendor/vendor-receivings${q}`);
+  },
+
+  confirmVendorReceiving: (arrivalId: string, input: {
+    id: string;
+    items: { productName: string; unit: string; qty: number }[];
+    receivedAt: string;
+    receivingBy: string;
+    remarks: string;
+  }) =>
+    request<VendorReceiving>(`/vendor/arrivals/${encodeURIComponent(arrivalId)}/vendor-receivings`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
 
   /* Slide the server-side 30-minute inactivity window (Stay Logged In / active
      heartbeat). The backend enforces the same window on every /api/vendor call. */

@@ -8,16 +8,16 @@ import {
   ClipboardPlus, Send, CalendarClock, ArrowDownUp,
 } from "lucide-react";
 import {
-  Supplier, SupplyReceipt, ReceiptItem, ReceiptCondition, SupplyStatus, AppNotification,
-  UNIT_OPTIONS, SUPPLY_STATUS_CFG, CONDITION_LABEL,
-  genId, fmtDate, fmtDateTime, arrivalReceivedQty, arrivalHasIssue, receiptHasIssue,
+  Supplier, SupplyReceipt, SupplyArrival, SupplyItem, ReceiptItem, ReceiptCondition, SupplyStatus, AppNotification,
+  UNIT_OPTIONS, SUPPLY_STATUS_CFG, CONDITION_LABEL, supplyStatusCfg,
+  genId, fmtDate, fmtDateTime, arrivalAcceptedGood, arrivalHasIssue, receiptHasIssue, arrivalVendorReceivedQty,
   supplierReceivedQty, VendorData, VendorActions,
-  RequestPriority, SupplyRequest, SupplyRequestStatus, SupplyRequestInput,
+  RequestPriority, SupplyRequest, SupplyRequestStatus, SupplyRequestInput, SupplyDeliveryDocument,
   REQUEST_PRIORITIES, REQUEST_PRIORITY_LABEL, REQUEST_STATUS_CFG,
   ROLE_LABELS, SystemRole,
 } from "./vendor-data";
 import { api, ApiError, getSessionUser, setSessionUser, setToken } from "./api";
-import { usePagePersistence, useDraftPersistence, saveDraft, clearDraft, DraftType } from "./draft-persistence";
+import { usePagePersistence, useDraftPersistence, saveDraft, clearDraft } from "./draft-persistence";
 
 /* ─────────────────────────────────────────────────────────
    TRI-M GLOBAL LOGISTICS & TRADING INC. — VENDOR MANAGEMENT
@@ -28,12 +28,12 @@ import { usePagePersistence, useDraftPersistence, saveDraft, clearDraft, DraftTy
 
 type Page = "dashboard" | "receiving" | "monitor" | "request" | "suppliers" | "history";
 
-type ReceivingPreset = { arrivalStatus: "expected" | "for_receiving" | "partially_received" };
+type ReceivingPreset = { arrivalStatus: "expected" | "pending" | "partially_received" };
 type HistoryPreset = { arrivalStatus?: SupplyStatus; issuesOnly?: boolean; from?: string; to?: string };
 
 const RECEIVE_PRESET_LABEL: Record<ReceivingPreset["arrivalStatus"], string> = {
   expected: "Expected Deliveries",
-  for_receiving: "For Receiving",
+  pending: "Pending Receiving",
   partially_received: "Partially Received",
 };
 
@@ -63,8 +63,8 @@ const MonoId = ({ id }: { id: string }) => (
   <span className="font-mono text-[11px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded tracking-tight">{id}</span>
 );
 
-const SupplyBadge = ({ status }: { status: SupplyStatus }) => {
-  const c = SUPPLY_STATUS_CFG[status];
+const SupplyBadge = ({ status }: { status: SupplyStatus | string }) => {
+  const c = supplyStatusCfg(status);
   return (
     <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold rounded-full border ${c.cls}`}>
       <span className={`w-1.5 h-1.5 rounded-full ${c.dot}`} />{c.label}
@@ -173,8 +173,12 @@ const Modal = ({ open, onClose, title, children, footer, maxW = "max-w-[640px]" 
 };
 
 const ReceiptDetailsModal = ({ rec, onClose }: { rec: SupplyReceipt | null; onClose: () => void }) => (
-  <Modal open={!!rec} onClose={onClose} title={rec ? `Receiving Transaction · ${rec.id}` : "Receiving"} maxW="max-w-[680px]"
-    footer={rec && <div className="flex justify-end"><Btn variant="secondary" size="sm" onClick={onClose}>Close</Btn></div>}>
+  <Modal open={!!rec} onClose={onClose} title={rec ? `Receiving Record · ${rec.id}` : "Receiving Record"} maxW="max-w-[680px]"
+    footer={rec && (
+      <div className="flex flex-wrap justify-end gap-3">
+        <Btn variant="secondary" size="sm" onClick={onClose}>Close</Btn>
+      </div>
+    )}>
     {rec && (
       <div className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2"><MonoId id={rec.id} /><ReceiptStatusPill rec={rec} /></div>
@@ -210,30 +214,46 @@ const ReceiptDetailsModal = ({ rec, onClose }: { rec: SupplyReceipt | null; onCl
   </Modal>
 );
 
-/* ── receiving auto report (PDF) password modal ─────────── */
+/* ── receiving auto report (PDF) viewer ───────────────────
+   The generated report is shown inside an in-app modal rather than a
+   separate browser tab, so no development-origin URL (e.g. a blob
+   URL derived from localhost) is ever visible to the user. */
+const PdfViewerModal = ({ data, onClose, titleLabel = "Receiving Report" }: { data: { pdfBase64: string; filename: string } | null; onClose: () => void; titleLabel?: string }) => {
+  const [url, setUrl] = React.useState<string | null>(null);
 
-const openPdfInViewer = (pdfBase64: string, filename: string) => {
-  const bin = atob(pdfBase64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
-  const win = window.open(url, "_blank");
-  if (!win) {
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-  }
-  window.setTimeout(() => URL.revokeObjectURL(url), 120000);
+  React.useEffect(() => {
+    if (!data) return;
+    const bin = atob(data.pdfBase64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const u = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+    setUrl(u);
+    return () => { setUrl(null); URL.revokeObjectURL(u); };
+  }, [data]);
+
+  return (
+    <Modal open={!!data && !!url} onClose={onClose} title={data ? `${titleLabel} · ${data.filename}` : titleLabel} maxW="max-w-4xl"
+      footer={data && (
+        <div className="flex flex-wrap justify-end gap-3">
+          {url && (
+            <a href={url} download={data.filename} className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-xl bg-[#5b21b6] text-white hover:bg-[#4c1d95] transition-colors"><FileDown size={13} /> Download PDF</a>
+          )}
+          <Btn variant="secondary" size="sm" onClick={onClose}>Close</Btn>
+        </div>
+      )}>
+      {data && url && (
+        <iframe title={data.filename} src={url} className="w-full h-[68vh] rounded-xl border border-slate-200" />
+      )}
+    </Modal>
+  );
 };
 
-const ReportPasswordModal = ({ open, onClose, from, to }: {
+const ReportPasswordModal = ({ open, onClose, from, to, onPdfGenerated }: {
   open: boolean;
   onClose: () => void;
   from: string;
   to: string;
+  onPdfGenerated: (pdfBase64: string, filename: string) => void;
 }) => {
   const [password, setPassword] = React.useState("");
   const [show, setShow] = React.useState(false);
@@ -260,7 +280,7 @@ const ReportPasswordModal = ({ open, onClose, from, to }: {
         to: to.trim() || undefined,
       });
       setPassword("");
-      openPdfInViewer(r.pdfBase64, r.filename);
+      onPdfGenerated(r.pdfBase64, r.filename);
       onClose();
     } catch (err) {
       setPhase("idle");
@@ -440,7 +460,6 @@ export default function VendorManagement(props: Props) {
   const [page, setPage, pageLoaded] = usePagePersistence<Page>("dashboard");
   const [mobileOpen, setMobileOpen] = React.useState(false);
   const [collapsed, setCollapsed] = React.useState(false);
-  const [receiptTarget, setReceiptTarget] = React.useState<string | null>(null);
   const [receivingPreset, setReceivingPreset] = React.useState<ReceivingPreset | null>(null);
   const [historyPreset, setHistoryPreset] = React.useState<HistoryPreset | null>(null);
   const [notifOpen, setNotifOpen] = React.useState(false);
@@ -545,12 +564,6 @@ export default function VendorManagement(props: Props) {
   const currentLabel = NAV.find(n => n.page === currentPage)?.label ?? "Dashboard";
   const toNext = (p: Page) => { setPage(p); window.scrollTo({ top: 0 }); };
 
-  const startReceiving = (arrivalId?: string) => {
-    if (arrivalId) setReceiptTarget(arrivalId);
-    setReceivingPreset(null);
-    setPage("receiving");
-  };
-
   const openReceiving = (preset: ReceivingPreset | null) => {
     setReceivingPreset(preset);
     setPage("receiving");
@@ -642,9 +655,9 @@ export default function VendorManagement(props: Props) {
                 </div>
               )}
               <div key={currentPage} className="page-enter mx-auto max-w-[1440px]">
-                {currentPage === "dashboard" && <Dashboard role={role} data={data} goTo={toNext} startReceiving={startReceiving} actions={actions} onOpenReceiving={openReceiving} onOpenHistory={openHistory} />}
-                {currentPage === "receiving" && <Receiving data={data} actions={actions} target={receiptTarget} onTargetConsumed={() => setReceiptTarget(null)} goTo={toNext} preset={receivingPreset} onPresetConsumed={() => setReceivingPreset(null)} />}
-                {currentPage === "monitor" && <SupplyMonitoring data={data} actions={actions} startReceiving={startReceiving} goTo={toNext} />}
+                {currentPage === "dashboard" && <Dashboard role={role} data={data} goTo={toNext} actions={actions} onOpenReceiving={openReceiving} onOpenHistory={openHistory} />}
+                {currentPage === "receiving" && <Receiving data={data} actions={actions} goTo={toNext} preset={receivingPreset} onPresetConsumed={() => setReceivingPreset(null)} />}
+                {currentPage === "monitor" && <SupplyMonitoring data={data} actions={actions} goTo={toNext} />}
                 {currentPage === "request" && <RequestSupply data={data} actions={actions} goTo={toNext} />}
                 {currentPage === "suppliers" && <Suppliers data={data} actions={actions} />}
                 {currentPage === "history" && <ReceivingHistory data={data} actions={actions} preset={historyPreset} onPresetConsumed={() => setHistoryPreset(null)} />}
@@ -668,8 +681,8 @@ export default function VendorManagement(props: Props) {
 
 /* ── dashboard ─────────────────────────────────────────── */
 
-const Dashboard = ({ role, data, goTo, startReceiving, actions, onOpenReceiving, onOpenHistory }: {
-  role: string; data: VendorData; goTo: (p: Page) => void; startReceiving: (id?: string) => void;
+const Dashboard = ({ role, data, goTo, actions, onOpenReceiving, onOpenHistory }: {
+  role: string; data: VendorData; goTo: (p: Page) => void;
   actions: VendorActions;
   onOpenReceiving: (preset: ReceivingPreset | null) => void;
   onOpenHistory: (preset: HistoryPreset | null) => void;
@@ -678,11 +691,9 @@ const Dashboard = ({ role, data, goTo, startReceiving, actions, onOpenReceiving,
   const [viewingRec, setViewingRec] = React.useState<SupplyReceipt | null>(null);
   const count = (s: SupplyStatus) => arrivals.filter(a => a.status === s).length;
   const expected = count("expected");
-  const forReceiving = count("for_receiving");
+  const pendingCount = count("pending");
   const partial = count("partially_received");
-  const received = count("received");
   const completed = count("completed");
-  const rejected = count("rejected_damaged");
 
   const pendingRequests = supplyRequests.filter(r => ["submitted", "under_review", "approved", "processing", "fulfillment_in_progress"].includes(r.status)).length;
   const underReview = supplyRequests.filter(r => r.status === "under_review").length;
@@ -692,7 +703,7 @@ const Dashboard = ({ role, data, goTo, startReceiving, actions, onOpenReceiving,
   const recentReceipts = [...receipts].sort((a, b) => +new Date(b.receivedAt) - +new Date(a.receivedAt)).slice(0, 5);
   const recentNotifs = data.notifications.slice(0, 4);
   const unreadNotifs = data.notifications.filter(n => !n.read).length;
-  const upcoming = arrivals.filter(a => a.status === "expected" || a.status === "for_receiving")
+  const upcoming = arrivals.filter(a => a.status === "expected" || a.status === "pending")
     .sort((a, b) => +a.expectedDate - +b.expectedDate).slice(0, 5);
 
   return (
@@ -706,18 +717,17 @@ const Dashboard = ({ role, data, goTo, startReceiving, actions, onOpenReceiving,
           </div>
         </div>
         <div className="flex gap-2 flex-wrap">
-          <Btn size="sm" onClick={() => startReceiving()}><PackagePlus size={14} /> Record Receiving</Btn>
+          <Btn size="sm" onClick={() => onOpenReceiving(null)}><PackageCheck size={14} /> Record Received</Btn>
           <Btn size="sm" variant="secondary" onClick={() => goTo("monitor")}><PackageSearch size={14} /> Supply Monitoring</Btn>
         </div>
       </Card>
 
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6 gap-4">
         <KpiCard icon={<Clock size={18} className="text-sky-600" />} label="Expected Deliveries" value={expected} sub={expected > 0 ? "Awaiting arrival" : "No upcoming"} color="bg-sky-50" onClick={() => onOpenReceiving({ arrivalStatus: "expected" })} />
-        <KpiCard icon={<Truck size={18} className="text-amber-600" />} label="For Receiving" value={forReceiving} sub="At facility, pending receive" color="bg-amber-50" onClick={() => onOpenReceiving({ arrivalStatus: "for_receiving" })} />
+        <KpiCard icon={<Truck size={18} className="text-amber-600" />} label="Pending Receiving" value={pendingCount} sub="At facility, pending receive" color="bg-amber-50" onClick={() => onOpenReceiving({ arrivalStatus: "pending" })} />
         <KpiCard icon={<Boxes size={18} className="text-green-600" />} label="Supplies Received" value={receipts.length} sub="Total receiving transactions" color="bg-green-50" onClick={() => onOpenHistory(null)} />
-        <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Received" value={partial} sub="Balance pending" color="bg-orange-50" onClick={() => onOpenReceiving({ arrivalStatus: "partially_received" })} />
+        <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Received" value={partial} sub="Vendor acknowledgment pending" color="bg-orange-50" onClick={() => onOpenReceiving({ arrivalStatus: "partially_received" })} />
         <KpiCard icon={<PackageCheck size={18} className="text-indigo-600" />} label="Completed Receiving" value={completed} sub="Closed & forwarded" color="bg-indigo-50" onClick={() => onOpenHistory({ arrivalStatus: "completed" })} />
-        <KpiCard icon={<AlertTriangle size={18} className="text-red-600" />} label="Issues / Damaged" value={rejected} sub={rejected > 0 ? "Needs attention" : "No issues"} color="bg-red-50" onClick={() => onOpenHistory({ issuesOnly: true })} />
       </div>
 
       {role === "admin" && (
@@ -786,7 +796,7 @@ const Dashboard = ({ role, data, goTo, startReceiving, actions, onOpenReceiving,
           </div>
           <div className="space-y-2">
             {upcoming.map(a => (
-              <button key={a.id} type="button" onClick={() => startReceiving(a.id)} title="Open receiving for this delivery" className="w-full text-left flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100 hover:border-violet-200 hover:bg-violet-50/30 transition-colors cursor-pointer group">
+              <button key={a.id} type="button" onClick={() => onOpenReceiving({ arrivalStatus: "expected" })} title="Open the expected deliveries list" className="w-full text-left flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100 hover:border-violet-200 hover:bg-violet-50/30 transition-colors cursor-pointer group">
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-slate-700 flex items-center gap-2 truncate"><MonoId id={a.id} /><span className="truncate">{a.supplierName}</span></p>
                   <p className="text-xs text-slate-400 truncate">{a.items.map(i => `${i.productName} (${i.qty} ${i.unit})`).join(", ")}</p>
@@ -1154,23 +1164,59 @@ const RequestDetail = ({ request, onClose, onEdit, actions }: {
   );
 };
 
+/* Simplified request-status filter model. The backend keeps the full
+   granular status set (draft/submitted/under_review/approved/processing/
+   fulfillment_in_progress/partially_fulfilled/fulfilled/rejected/cancelled);
+   the UI groups related statuses into a shorter, workflow-focused list. */
+type RequestFilterKey = "all" | "draft" | "under_review" | "approved" | "in_progress" | "partially_fulfilled" | "fulfilled" | "rejected" | "cancelled";
+
+const REQUEST_FILTER_GROUPS: Record<Exclude<RequestFilterKey, "all">, SupplyRequestStatus[]> = {
+  draft: ["draft"],
+  under_review: ["submitted", "under_review"],
+  approved: ["approved"],
+  in_progress: ["processing", "fulfillment_in_progress"],
+  partially_fulfilled: ["partially_fulfilled"],
+  fulfilled: ["fulfilled"],
+  rejected: ["rejected"],
+  cancelled: ["cancelled"],
+};
+
+const REQUEST_PRIMARY_FILTERS: { key: Exclude<RequestFilterKey, "all">; label: string }[] = [
+  { key: "draft", label: "Draft" },
+  { key: "under_review", label: "Under Review" },
+  { key: "approved", label: "Approved" },
+  { key: "in_progress", label: "In Progress" },
+  { key: "partially_fulfilled", label: "Partially Fulfilled" },
+  { key: "fulfilled", label: "Fulfilled" },
+];
+
+const REQUEST_MORE_FILTERS: { key: Exclude<RequestFilterKey, "all">; label: string }[] = [
+  { key: "rejected", label: "Rejected" },
+  { key: "cancelled", label: "Cancelled" },
+];
+
 const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: VendorActions; goTo: (p: Page) => void }) => {
-  const [filter, setFilter] = React.useState<SupplyRequestStatus | "all">("all");
+  const [filter, setFilter] = React.useState<RequestFilterKey>("all");
+  const [moreOpen, setMoreOpen] = React.useState(false);
   const [q, setQ] = React.useState("");
   const [formOpen, setFormOpen] = React.useState(false);
   const [editing, setEditing] = React.useState<SupplyRequest | null>(null);
   const [viewing, setViewing] = React.useState<SupplyRequest | null>(null);
 
-  const STATUSES: SupplyRequestStatus[] = ["draft", "submitted", "under_review", "approved", "processing", "fulfillment_in_progress", "partially_fulfilled", "fulfilled", "rejected", "cancelled"];
-
   const filtered = data.supplyRequests.filter(r => {
-    const matchF = filter === "all" || r.status === filter;
+    const matchF = filter === "all" || REQUEST_FILTER_GROUPS[filter].includes(r.status);
     const qq = q.toLowerCase();
     const matchQ = !qq || r.id.toLowerCase().includes(qq) || r.reason.toLowerCase().includes(qq) || r.items.some(i => i.productName.toLowerCase().includes(qq));
     return matchF && matchQ;
   }).sort((a, b) => +new Date(b.requestDate) - +new Date(a.requestDate));
 
-  const pendingCount = (s: SupplyRequestStatus) => data.supplyRequests.filter(r => r.status === s).length;
+  const filterCount = (key: RequestFilterKey) =>
+    key === "all" ? data.supplyRequests.length : data.supplyRequests.filter(r => REQUEST_FILTER_GROUPS[key].includes(r.status)).length;
+
+  const moreActive = filter === "rejected" || filter === "cancelled";
+
+  const pill = (active: boolean) =>
+    `px-3 py-1.5 text-xs font-semibold rounded-full border transition-colors ${active ? "bg-[#5b21b6] text-white border-[#5b21b6]" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"}`;
 
   return (
     <div className="space-y-5">
@@ -1180,10 +1226,23 @@ const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: Ven
           <input className={`${inp} pl-9`} placeholder="Search request ref, reason, or product…" value={q} onChange={e => setQ(e.target.value)} />
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <button onClick={() => setFilter("all")} className={`px-3 py-1.5 text-xs font-semibold rounded-full border transition-colors ${filter === "all" ? "bg-[#5b21b6] text-white border-[#5b21b6]" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"}`}>All ({data.supplyRequests.length})</button>
-          {STATUSES.map(s => (
-            <button key={s} onClick={() => setFilter(s)} className={`px-3 py-1.5 text-xs font-semibold rounded-full border transition-colors ${filter === s ? "bg-[#5b21b6] text-white border-[#5b21b6]" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"}`}>{REQUEST_STATUS_CFG[s].label} ({pendingCount(s)})</button>
+          <button onClick={() => { setFilter("all"); setMoreOpen(false); }} className={pill(filter === "all")}>All ({filterCount("all")})</button>
+          {REQUEST_PRIMARY_FILTERS.map(f => (
+            <button key={f.key} onClick={() => { setFilter(f.key); setMoreOpen(false); }} className={pill(filter === f.key)}>{f.label} ({filterCount(f.key)})</button>
           ))}
+          <div className="relative">
+            <button onClick={() => setMoreOpen(o => !o)} aria-haspopup="menu" aria-expanded={moreOpen} className={`${pill(moreActive)} inline-flex items-center gap-1`}>More <ChevronDown size={13} className={`transition-transform ${moreOpen ? "rotate-180" : ""}`} /></button>
+            {moreOpen && (
+              <>
+                <div className="fixed inset-0 z-20" onClick={() => setMoreOpen(false)} />
+                <div role="menu" className="absolute right-0 top-full mt-2 z-30 min-w-[170px] rounded-xl border border-slate-200 bg-white p-1 shadow-lg">
+                  {REQUEST_MORE_FILTERS.map(f => (
+                    <button key={f.key} role="menuitem" onClick={() => { setFilter(f.key); setMoreOpen(false); }} className={`block w-full text-left px-3 py-2 text-xs font-semibold rounded-lg transition-colors ${filter === f.key ? "bg-violet-50 text-violet-700" : "text-slate-600 hover:bg-slate-50"}`}>{f.label} ({filterCount(f.key)})</button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
         </div>
         <Btn className="shrink-0" onClick={() => { setEditing(null); setFormOpen(true); }}><Plus size={15} /> Create Request</Btn>
       </Card>
@@ -1259,20 +1318,7 @@ const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: Ven
   );
 };
 
-/* ── receiving form helpers ────────────────────────────── */
-
-const localNowValue = () => {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-};
-
-const toLocalInput = (iso: string) => {
-  const d = new Date(iso);
-  if (isNaN(+d)) return localNowValue();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-};
+/* ── form helpers ─────────────────────────────────────── */
 
 const MAP_BACKEND_FIELDS: Record<string, string> = {
   supplier_reference: "docRef",
@@ -1292,256 +1338,20 @@ const mapFieldErrors = (errors?: Record<string, string>): Record<string, string>
   return out;
 };
 
-const COUNT_UNITS = new Set(["pcs", "box", "case", "sack", "bag", "pack", "pallet"]);
-
-const emptyItem = (): ReceiptItem => ({ productName: "", qty: 1, unit: "pcs", condition: "good" });
-
-type ReceiptFormDraft = {
-  arrivalId: string;
-  supplierId: string;
-  items: ReceiptItem[];
-  receivedAt: string;
-  receivingBy: string;
-  docRef: string;
-  remarks: string;
-};
-
-const initialReceiptDraft = (): ReceiptFormDraft => ({
-  arrivalId: "",
-  supplierId: "",
-  items: [emptyItem()],
-  receivedAt: localNowValue(),
-  receivingBy: getSessionUser()?.displayName?.trim() ?? "",
-  docRef: "",
-  remarks: "",
-});
-
-const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, onSaved }: {
-  data: VendorData; actions: VendorActions; open: boolean;
-  editing: SupplyReceipt | null; targetArrivalId: string | null;
-  onClose: () => void; onSaved: () => void;
-}) => {
-  const draftKey = editing?.id ?? targetArrivalId ?? "new";
-  const [draft, setDraft, draftLoaded] = useDraftPersistence<ReceiptFormDraft>("receiving", initialReceiptDraft(), draftKey);
-  const [err, setErr] = React.useState("");
-  const [saving, setSaving] = React.useState(false);
-  const [fieldErr, setFieldErr] = React.useState<Record<string, string>>({});
-
-  const applyArrival = (id: string) => {
-    const arr = data.arrivals.find(a => a.id === id);
-    setDraft(d => ({
-      ...d,
-      arrivalId: id,
-      supplierId: arr?.supplierId ?? "",
-      items: arr ? arr.items.map(i => ({ productName: i.productName, qty: i.qty, unit: i.unit, condition: "good" as ReceiptCondition })) : [emptyItem()],
-    }));
-  };
-
-  React.useEffect(() => {
-    if (!open || !draftLoaded) return;
-    if (editing) {
-      const e = editing;
-      setDraft({
-        arrivalId: e.arrivalId,
-        supplierId: e.supplierId,
-        items: e.items.map(i => ({ ...i })),
-        receivedAt: toLocalInput(e.receivedAt),
-        receivingBy: e.receivingBy,
-        docRef: e.docRef,
-        remarks: e.remarks,
-      });
-    } else if (targetArrivalId) {
-      const arr = data.arrivals.find(a => a.id === targetArrivalId);
-      setDraft({
-        ...initialReceiptDraft(),
-        arrivalId: targetArrivalId,
-        supplierId: arr?.supplierId ?? "",
-        items: arr ? arr.items.map(i => ({ productName: i.productName, qty: i.qty, unit: i.unit, condition: "good" as ReceiptCondition })) : [emptyItem()],
-      });
-    } else {
-      setDraft(initialReceiptDraft());
-    }
-    setErr("");
-    setFieldErr({});
-    setSaving(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, editing, targetArrivalId, draftLoaded]);
-
-  const arrival = data.arrivals.find(a => a.id === draft.arrivalId) ?? null;
-  const supplier = data.suppliers.find(s => s.id === draft.supplierId) ?? null;
-  const totalQty = draft.items.reduce((a, i) => a + (Number(i.qty) || 0), 0);
-
-  const validate = (): { message: string; fields: Record<string, string> } | null => {
-    const fields: Record<string, string> = {};
-
-    if (!draft.supplierId) fields.items = "Choose a supplier or link an expected supply first.";
-    if (!draft.docRef.trim()) fields.docRef = "Supplier reference is required before confirming the receiving record.";
-    if (!draft.receivedAt || isNaN(+new Date(draft.receivedAt))) fields.receivedAt = "Received date/time is required before confirming the receiving record.";
-    if (!draft.receivingBy.trim()) fields.receivedBy = "Received by is required before confirming the receiving record.";
-    if (!draft.remarks.trim()) fields.remarks = "Remarks are required before confirming the receiving record.";
-
-    if (draft.items.length === 0) fields.items = "Add at least one product line with a valid quantity.";
-    else {
-      for (const it of draft.items) {
-        if (!it.productName.trim()) { fields.items = "Each item needs a product name."; break; }
-        const q = Number(it.qty);
-        if (!Number.isFinite(q) || q <= 0) { fields.items = "Each item quantity must be greater than zero."; break; }
-        if (COUNT_UNITS.has(it.unit) && !Number.isInteger(q)) { fields.items = `Quantity must be a whole number for "${it.unit}" units.`; break; }
-      }
-    }
-
-    if (Object.keys(fields).length === 0) return null;
-    return { message: fields[Object.keys(fields)[0]], fields };
-  };
-
-  const handleSave = async () => {
-    setErr("");
-    setFieldErr({});
-    const v = validate();
-    if (v) { setFieldErr(v.fields); setErr(v.message); return; }
-
-    const rec: SupplyReceipt = {
-      id: editing?.id ?? genId("RR"),
-      arrivalId: arrival ? arrival.id : "",
-      supplierId: draft.supplierId,
-      supplierName: supplier?.companyName ?? draft.supplierId,
-      items: draft.items.map(i => ({ ...i, qty: Number(i.qty) })),
-      totalQty,
-      receivedAt: new Date(draft.receivedAt).toISOString(),
-      receivingBy: draft.receivingBy.trim(),
-      docRef: draft.docRef.trim(),
-      remarks: draft.remarks.trim(),
-    };
-
-    setSaving(true);
-    try {
-      const res = await actions.recordReceipt(rec);
-      if (!res.ok) {
-        setFieldErr(mapFieldErrors(res.errors));
-        setErr(res.error ?? "Failed to save the receiving record.");
-        return;
-      }
-      clearDraft("receiving", draftKey);
-      onSaved();
-    } catch {
-      setErr("Failed to save the receiving record.");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <Modal open={open} onClose={onClose} title={editing ? `Edit Receiving Transaction · ${editing.id}` : "Record Supply Received"} maxW="max-w-[760px]"
-      footer={
-        <div className="flex flex-col gap-3">
-          {err && <div className="bg-red-50 border border-red-200 rounded-xl p-3 flex gap-2 text-xs text-red-600"><AlertCircle size={14} className="shrink-0" />{err}</div>}
-          <div className="flex gap-3 justify-end"><Btn variant="secondary" size="sm" onClick={onClose}>Cancel</Btn><Btn size="sm" onClick={handleSave} disabled={saving}>{saving ? <RefreshCw size={14} className="animate-spin" /> : <Save size={14} />} {saving ? "Saving…" : editing ? "Save Changes" : "Record Receiving"}</Btn></div>
-        </div>
-      }>
-      <div className="space-y-5">
-        <div className="bg-violet-50 border border-violet-200 rounded-xl p-3 flex gap-2 text-xs text-violet-700"><Info size={14} className="shrink-0 mt-0.5" /> Record the physical receipt of supplies delivered to the facility. Damaged or rejected items are recorded separately.</div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Expected Supply (optional)" hint="Link to the delivery schedule being fulfilled">
-            <div className="relative">
-              <select className={selectCls} value={draft.arrivalId} onChange={e => { const v = e.target.value; if (v) applyArrival(v); else { setDraft(d => ({ ...d, arrivalId: "" })); } }}>
-                <option value="">— Ad-hoc receiving —</option>
-                {data.arrivals.filter(a => a.status !== "completed").map(a => <option key={a.id} value={a.id}>{a.id} · {a.supplierName}</option>)}
-              </select>
-              <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-            </div>
-          </Field>
-          <Field label="Supplier Reference" required>
-            <div className="relative">
-              <select className={selectCls} value={draft.supplierId} onChange={e => setDraft(d => ({ ...d, supplierId: e.target.value }))} disabled={!!arrival}>
-                <option value="">— Choose supplier —</option>
-                {data.suppliers.filter(s => s.status === "active").map(s => <option key={s.id} value={s.id}>{s.companyName} · {s.id}</option>)}
-              </select>
-              <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-            </div>
-          </Field>
-        </div>
-
-        {arrival && (
-          <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-600 flex flex-wrap gap-x-4 gap-y-1">
-            <span>Delivery Schedule: <MonoId id={arrival.sourceRef} /></span>
-            <span>Expected: {fmtDate(arrival.expectedDate)} {arrival.expectedTime}</span>
-            <span>Destination: {arrival.destination}</span>
-            <span>Status: <SupplyBadge status={arrival.status} /></span>
-          </div>
-        )}
-
-        <div>
-          <div className="flex items-center justify-between mb-2">
-            <p className="text-sm font-semibold text-slate-700">Received Items — Quantity / Unit / Condition</p>
-            <button onClick={() => setDraft(d => ({ ...d, items: [...d.items, emptyItem()] }))} className="text-xs font-semibold text-violet-600 hover:text-violet-800 flex items-center gap-1"><Plus size={12} /> Add item</button>
-          </div>
-          <div className="space-y-2">
-            {draft.items.map((it, idx) => (
-              <div key={idx} className="grid grid-cols-1 sm:grid-cols-[2fr_0.6fr_0.7fr_auto_auto] gap-2 p-3 rounded-xl border border-slate-100 bg-slate-50/60">
-                <input className={inp} value={it.productName} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, productName: e.target.value } : x) }))} placeholder="Product / supply name" />
-                <input type="number" min={1} className={inp} value={it.qty} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, qty: Number(e.target.value) } : x) }))} placeholder="Qty" />
-                <div className="relative">
-                  <select className={selectCls} value={it.unit} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, unit: e.target.value } : x) }))}>
-                    {UNIT_OPTIONS.map(u => <option key={u} value={u}>{u}</option>)}
-                  </select>
-                  <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-                </div>
-                <div className="relative">
-                  <select className={selectCls} value={it.condition} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, condition: e.target.value as ReceiptCondition } : x) }))}>
-                    {(Object.keys(CONDITION_LABEL) as ReceiptCondition[]).map(c => <option key={c} value={c}>{CONDITION_LABEL[c]}</option>)}
-                  </select>
-                  <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-                </div>
-                <button onClick={() => setDraft(d => ({ ...d, items: d.items.filter((_, i) => i !== idx) }))} disabled={draft.items.length === 1} className="p-2 rounded-lg hover:bg-white border border-transparent hover:border-slate-200 text-slate-400 hover:text-red-600 disabled:opacity-30"><Trash2 size={14} /></button>
-              </div>
-            ))}
-          </div>
-          <div className="flex justify-end mt-3 text-sm"><span className="text-slate-500">Total Quantity: <strong className="text-slate-800">{totalQty}</strong></span></div>
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Received Date & Time" required error={fieldErr.receivedAt}><input type="datetime-local" className={inp} value={draft.receivedAt} onChange={e => setDraft(d => ({ ...d, receivedAt: e.target.value }))} /></Field>
-          <Field label="Received By" required error={fieldErr.receivedBy}><input className={inp} value={draft.receivingBy} onChange={e => setDraft(d => ({ ...d, receivingBy: e.target.value }))} placeholder="Receiving personnel" /></Field>
-        </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Document / Reference No." required error={fieldErr.docRef} hint="Delivery receipt, waybill, invoice…"><input className={inp} value={draft.docRef} onChange={e => setDraft(d => ({ ...d, docRef: e.target.value }))} placeholder="e.g. DR-2026-1234" /></Field>
-          <Field label="Remarks" required error={fieldErr.remarks}><input className={inp} value={draft.remarks} onChange={e => setDraft(d => ({ ...d, remarks: e.target.value }))} placeholder="Condition, notes, follow-ups…" /></Field>
-        </div>
-      </div>
-    </Modal>
-  );
-};
-
 /* ── receiving (record) ────────────────────────────────── */
 
-const Receiving = ({ data, actions, target, onTargetConsumed, goTo, preset, onPresetConsumed }: {
-  data: VendorData; actions: VendorActions;
-  target: string | null; onTargetConsumed: () => void; goTo: (p: Page) => void;
+const Receiving = ({ data, actions, goTo, preset, onPresetConsumed }: {
+  data: VendorData; actions: VendorActions; goTo: (p: Page) => void;
   preset?: ReceivingPreset | null; onPresetConsumed?: () => void;
 }) => {
   const [presetLocal, setPresetLocal] = React.useState<ReceivingPreset | null>(preset ?? null);
   const presetStatus = presetLocal?.arrivalStatus ?? null;
-  const [formOpen, setFormOpen] = React.useState(false);
-  const [formTarget, setFormTarget] = React.useState<string | null>(null);
-  const [editing, setEditing] = React.useState<SupplyReceipt | null>(null);
-
-  React.useEffect(() => {
-    if (target) {
-      setFormTarget(target);
-      setEditing(null);
-      setFormOpen(true);
-      onTargetConsumed();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [target]);
-
-  const openForm = (arrivalId?: string) => { setEditing(null); setFormTarget(arrivalId ?? null); setFormOpen(true); };
+  const [ackArrival, setAckArrival] = React.useState<SupplyArrival | null>(null);
 
   const clearPreset = () => { setPresetLocal(null); onPresetConsumed?.(); };
 
   const queueAll = data.arrivals
-    .filter(a => a.status === "for_receiving" || a.status === "partially_received" || a.status === "received")
+    .filter(a => a.status === "pending" || a.status === "partially_received")
     .sort((a, b) => a.expectedDate.localeCompare(b.expectedDate));
 
   const queue = presetStatus && presetStatus !== "expected" ? queueAll.filter(a => a.status === presetStatus) : queueAll;
@@ -1559,7 +1369,7 @@ const Receiving = ({ data, actions, target, onTargetConsumed, goTo, preset, onPr
       <Card className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
           <h2 className="text-sm font-bold text-slate-800">Receiving Work Queue</h2>
-          <p className="text-xs text-slate-400">Supplies at the facility, partially received, or awaiting final confirmation.</p>
+          <p className="text-xs text-slate-400">Deliveries already inspected and accepted by the Receiving &amp; Checker, awaiting the Vendor&apos;s final receipt acknowledgment.</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {presetLocal && (
@@ -1567,7 +1377,7 @@ const Receiving = ({ data, actions, target, onTargetConsumed, goTo, preset, onPr
               {RECEIVE_PRESET_LABEL[presetLocal.arrivalStatus]} only <X size={12} />
             </button>
           )}
-          <Btn size="sm" onClick={() => openForm()}><PackagePlus size={14} /> Record Receiving</Btn>
+          <Btn size="sm" variant="secondary" onClick={() => goTo("monitor")}><PackageSearch size={14} /> Expected Deliveries</Btn>
         </div>
       </Card>
 
@@ -1576,10 +1386,10 @@ const Receiving = ({ data, actions, target, onTargetConsumed, goTo, preset, onPr
           <div className="flex items-center gap-2 mb-3"><Clock size={15} className="text-sky-600" /><h3 className="text-sm font-bold text-slate-800">Expected Deliveries</h3></div>
           <div className="space-y-2">
             {expectedOnly.map(a => (
-              <button key={a.id} type="button" onClick={() => { clearPreset(); openForm(a.id); }} className="w-full text-left flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100 hover:border-violet-200 hover:bg-violet-50/30 transition-colors cursor-pointer group">
+              <div key={a.id} className="w-full flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100">
                 <div className="flex items-center gap-2 min-w-0"><MonoId id={a.id} /><span className="truncate text-slate-600">{a.supplierName} · {a.items.map(i => `${i.productName} (${i.qty} ${i.unit})`).join(", ")}</span></div>
-                <div className="flex items-center gap-2 shrink-0"><span className="text-slate-400">{fmtDate(a.expectedDate)} {a.expectedTime}</span><SupplyBadge status={a.status} /><Eye size={13} className="text-slate-300 group-hover:text-violet-500 transition-colors" /></div>
-              </button>
+                <div className="flex items-center gap-2 shrink-0"><span className="text-slate-400">{fmtDate(a.expectedDate)} {a.expectedTime}</span><SupplyBadge status={a.status} /></div>
+              </div>
             ))}
             {expectedOnly.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No expected deliveries.</p>}
           </div>
@@ -1590,35 +1400,56 @@ const Receiving = ({ data, actions, target, onTargetConsumed, goTo, preset, onPr
           <Card className="p-10 text-center">
             <PackageOpen size={28} className="text-slate-300 mx-auto mb-3" />
             <p className="text-sm font-semibold text-slate-600">Nothing pending receiving.</p>
-            <p className="text-xs text-slate-400 mt-1">Expected supplies will appear here once marked “For Receiving” in Supply Monitoring.</p>
+            <p className="text-xs text-slate-400 mt-1">Accepted supplies will appear here once the Receiving &amp; Checker completes its inspection.</p>
           </Card>
         )}
 
         {queue.map(a => {
-          const qty = arrivalReceivedQty(a.id, data.receipts);
           const bad = arrivalHasIssue(a.id, data.receipts);
+          const ackAvail = (a.acceptedQty ?? 0) > (a.receivedQty ?? 0);
           return (
-            <Card key={a.id} className="p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2 mb-1">
-                  <MonoId id={a.id} />
-                  <span className="text-sm font-bold text-slate-800">{a.supplierName}</span>
-                  <SupplyBadge status={a.status} />
+            <Card key={a.id} className="p-5 flex flex-col gap-3">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2 mb-1">
+                    <MonoId id={a.id} />
+                    <span className="text-sm font-bold text-slate-800">{a.supplierName}</span>
+                    <SupplyBadge status={a.status} />
+                  </div>
+                  <div className="max-w-md">
+                    <ProgressBar received={a.receivedQty ?? 0} total={a.requiredQty ?? a.totalQty} bad={bad} />
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    {`Checker accepted ${(a.acceptedQty ?? 0).toLocaleString()} · Vendor received ${(a.receivedQty ?? 0).toLocaleString()} · ${(a.remainingQty ?? 0).toLocaleString()} remaining`}
+                  </p>
                 </div>
-                <p className="text-xs text-slate-500 mb-1">{a.items.map(i => `${i.productName} — ${i.qty.toLocaleString()} ${i.unit}`).join(" · ")}</p>
-                <div className="max-w-md"><ProgressBar received={qty} total={a.totalQty} bad={bad} /></div>
-                <p className="text-[11px] text-slate-400 mt-1">Expected {fmtDate(a.expectedDate)} {a.expectedTime} · {a.destination}</p>
+                <div className="flex gap-2 shrink-0 flex-wrap">
+                  {ackAvail && <Btn size="sm" onClick={() => setAckArrival(a)}><PackageCheck size={13} /> Record Received</Btn>}
+                </div>
               </div>
-              <div className="flex gap-2 shrink-0 flex-wrap">
-                {a.status === "for_receiving" && <Btn size="sm" onClick={() => openForm(a.id)}><PackagePlus size={13} /> Receive Supply</Btn>}
-                {a.status === "partially_received" && <Btn size="sm" onClick={() => openForm(a.id)}><RefreshCw size={13} /> Record Balance</Btn>}
-                {a.status === "received" && (
-                  <>
-                    <Btn size="sm" variant="secondary" onClick={() => goTo("history")}><Eye size={13} /> View Receipts</Btn>
-                    <Btn size="sm" onClick={() => { if (confirm(`Complete receiving for ${a.supplierName} (${a.id}) and forward to inventory?`)) actions.updateArrivalStatus(a.id, "completed"); }}><PackageCheck size={13} /> Complete Receiving</Btn>
-                  </>
-                )}
-              </div>
+
+              {a.items.length > 0 && (
+                <div className="rounded-xl border border-slate-100 bg-slate-50/50 p-3 grid gap-1.5">
+                  {a.items.map(item => {
+                    const accepted = item.acceptedQty ?? 0;
+                    const damaged = item.damagedQty ?? 0;
+                    const vendorReceived = item.vendorReceived ?? 0;
+                    const remaining = item.remainingQty ?? Math.max(0, (item.qty ?? 0) - vendorReceived);
+                    return (
+                      <div key={item.productName} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs">
+                        <span className="font-semibold text-slate-600">{item.productName}</span>
+                        <span className="flex items-center gap-2.5 text-slate-500">
+                          <span className="inline-flex items-center gap-1"><span className="text-slate-300">Required</span><b className="text-slate-700">{item.qty.toLocaleString()}</b></span>
+                          <span className="inline-flex items-center gap-1"><span className="text-slate-300">Accepted</span><b className="text-green-700">{accepted.toLocaleString()}</b></span>
+                          <span className="inline-flex items-center gap-1"><span className="text-slate-300">Received</span><b className="text-sky-700">{vendorReceived.toLocaleString()}</b></span>
+                          <span className="inline-flex items-center gap-1"><span className="text-slate-300">Remaining</span><b className="text-amber-600">{remaining.toLocaleString()}</b></span>
+                          {damaged > 0 && <span className="inline-flex items-center gap-1"><span className="text-slate-300">Damaged</span><b className="text-red-600">{damaged.toLocaleString()}</b></span>}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </Card>
           );
         })}
@@ -1639,34 +1470,313 @@ const Receiving = ({ data, actions, target, onTargetConsumed, goTo, preset, onPr
         </Card>
       )}
 
-      <ReceiptForm
-        data={data} actions={actions} open={formOpen}
-        editing={editing} targetArrivalId={formTarget}
-        onClose={() => { clearDraft("receiving", editing?.id ?? formTarget ?? "new"); setFormOpen(false); setEditing(null); setFormTarget(null); }}
-        onSaved={() => { setFormOpen(false); setEditing(null); setFormTarget(null); }}
-      />
+      {ackArrival && (
+        <RecordReceivedModal
+          arrival={ackArrival} data={data} actions={actions}
+          onClose={() => setAckArrival(null)}
+        />
+      )}
     </div>
+  );
+};
+
+const RecordReceivedModal = ({ arrival, data, actions, onClose }: {
+  arrival: SupplyArrival; data: VendorData; actions: VendorActions; onClose: () => void;
+}) => {
+  const [phase, setPhase] = React.useState<"confirm" | "working" | "success">("confirm");
+  const [remarks, setRemarks] = React.useState("");
+  const [lines, setLines] = React.useState<Record<string, number>>({});
+  const [err, setErr] = React.useState("");
+  const [documents, setDocuments] = React.useState<SupplyDeliveryDocument[]>([]);
+  const [docErr, setDocErr] = React.useState("");
+  const [now, setNow] = React.useState(() => new Date());
+  const [receivingId] = React.useState<string>(() => genId("VRC"));
+  const viewUrlRef = React.useRef<string>("");
+
+  React.useEffect(() => {
+    const init: Record<string, number> = {};
+    for (const it of arrival.items) {
+      const available = Math.max(0, it.availableQty ?? 0);
+      init[`${it.productName}::${it.unit}`] = available;
+    }
+    setLines(init);
+  }, [arrival.id]);
+
+  /* Preview of the current time only — the authoritative Receiving timestamp
+     is generated by the backend when Confirmation is submitted. */
+  React.useEffect(() => {
+    const t = window.setInterval(() => setNow(new Date()), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const docs = await actions.listArrivalDocuments(arrival.id);
+        if (alive) setDocuments(docs);
+      } catch {
+        if (alive) setDocErr("The linked document list is currently unavailable.");
+      }
+    })();
+    return () => { alive = false; };
+  }, [arrival.id, actions]);
+
+  const busy = phase !== "confirm";
+  const requestClose = () => { if (!busy) onClose(); };
+
+  /* Received By is the authenticated Vendor account — read-only. */
+  const sessionUser = getSessionUser();
+  const receivedBy = sessionUser?.displayName?.trim() ?? sessionUser?.username?.trim() ?? "";
+
+  const setLine = (key: string, value: string) => {
+    setLines(prev => ({ ...prev, [key]: Number(value) }));
+  };
+
+  const itemsToSend = () => arrival.items
+    .map(it => ({ productName: it.productName, unit: it.unit, qty: Number(lines[`${it.productName}::${it.unit}`] ?? 0) }))
+    .filter(i => i.qty > 0);
+
+  const isEmpty = (arrival.acceptedQty ?? 0) <= 0;
+  const requiredTotal = arrival.requiredQty ?? arrival.totalQty ?? 0;
+  const fullyReceived = (arrival.receivedQty ?? 0) >= requiredTotal - 1e-9;
+  const receiveableItems = arrival.items.filter(it => (it.acceptedQty ?? 0) > 0);
+
+  const receivingTotal = itemsToSend().reduce((a, i) => a + Number(i.qty), 0);
+
+  const latestReceiving = [...data.vendorReceivings].filter(v => v.arrivalId === arrival.id)
+    .sort((a, b) => b.receivedAt.localeCompare(a.receivedAt))[0] ?? null;
+
+  const handleViewDoc = async (doc: SupplyDeliveryDocument) => {
+    try {
+      const blob = await actions.fetchArrivalFile(arrival.id, doc.id);
+      if (viewUrlRef.current) URL.revokeObjectURL(viewUrlRef.current);
+      viewUrlRef.current = URL.createObjectURL(blob);
+      window.open(viewUrlRef.current, "_blank", "noopener");
+    } catch {
+      setDocErr("Could not open the linked document. Try again later.");
+    }
+  };
+
+  const handleConfirm = async () => {
+    setErr("");
+    if (!receivedBy) {
+      setErr("Your account has no display name to record as the receiver. Ask an administrator to set it first.");
+      return;
+    }
+    const items = itemsToSend();
+    if (items.length === 0) { setErr("Enter a positive Received Quantity for at least one product."); return; }
+    for (const i of items) {
+      const item = arrival.items.find(t => t.productName === i.productName && t.unit === i.unit);
+      const available = Math.max(0, item?.availableQty ?? 0);
+      if (i.qty > available) {
+        setErr(`Received Quantity (${i.qty.toLocaleString()}) exceeds the remaining accepted stock (${available.toLocaleString()}) for "${i.productName}".`);
+        return;
+      }
+    }
+    setPhase("working");
+    const res = await actions.confirmVendorReceiving(arrival.id, {
+      id: receivingId,
+      items,
+      receivedAt: now.toISOString(),
+      receivingBy: receivedBy,
+      remarks: remarks.trim(),
+    });
+    if (res.ok) setPhase("success");
+    else { setPhase("confirm"); setErr(res.error ?? "Could not record the received stock. Try again."); }
+  };
+
+  const SectionTitle = ({ children }: { children: React.ReactNode }) => (
+    <div className="flex items-center gap-2 text-[11px] uppercase tracking-widest font-bold text-[#5b21b6] mb-2">{children}</div>
+  );
+
+  const InfoRow = ({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) => (
+    <div className="flex items-start justify-between gap-4 py-1.5">
+      <span className="text-xs text-slate-500 shrink-0">{label}</span>
+      <span className={`text-sm font-semibold text-slate-800 text-right ${mono ? "font-mono" : ""}`}>{value}</span>
+    </div>
+  );
+
+  const fmtSize = (b: number) =>
+    b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : b >= 1024 ? `${Math.round(b / 1024)} KB` : `${b} B`;
+
+  if (phase === "success") {
+    return (
+      <Modal open onClose={onClose} title="Receiving Recorded" maxW="max-w-md"
+        footer={<div className="flex justify-end"><Btn size="sm" onClick={onClose}>Done</Btn></div>}>
+        <div className="flex gap-3 items-start">
+          <span className="shrink-0 rounded-full bg-green-100 text-green-600 p-2"><CheckCircle2 size={18} /></span>
+          <div className="min-w-0">
+            <p className="text-sm text-slate-600 leading-relaxed"><strong className="text-slate-800"><MonoId id={arrival.id} /></strong> — received as <span className="font-mono font-semibold text-green-700">{receivingId}</span> · Received By <strong className="text-slate-800">{receivedBy}</strong>.</p>
+            {fullyReceived
+              ? <p className="text-xs text-slate-400 mt-1">All required stock is now received. The delivery is <strong className="text-slate-600">Completed</strong> and read-only.</p>
+              : <p className="text-xs text-slate-400 mt-1">Partial acknowledgment recorded ({receivingTotal.toLocaleString()} received now). The delivery remains <strong className="text-slate-600">Partially Received</strong> — {(arrival.receivedQty ?? 0).toLocaleString()} of {requiredTotal.toLocaleString()} required units acknowledged.</p>}
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal open onClose={requestClose} title={`Record Received · ${arrival.id}`} maxW="max-w-lg"
+      footer={
+        <div className="flex flex-wrap justify-end gap-3">
+          <Btn variant="secondary" size="sm" onClick={requestClose} disabled={busy}>Cancel</Btn>
+          {!isEmpty && !fullyReceived && (
+            <Btn size="sm" onClick={() => void handleConfirm()} disabled={busy}>
+              {phase === "working" ? <RefreshCw size={13} className="animate-spin" /> : <PackageCheck size={13} />}
+              {phase === "working" ? "Confirming…" : "Confirm Receipt"}
+            </Btn>
+          )}
+        </div>
+      }>
+      <p className="text-sm text-slate-600 mb-4">
+        Confirm the stock the Vendor acknowledges receiving today. The accepted quantities have already been fixed by the Receiving/Checker subsystem.
+      </p>
+
+      {/* Delivery Information */}
+      <div className="rounded-xl border border-slate-200 p-3.5 mb-4">
+        <SectionTitle><Truck size={13} />Delivery Information</SectionTitle>
+        <InfoRow label="Supply Chain Reference" value={<MonoId id={arrival.sourceRef} />} mono />
+        <InfoRow label="Delivery ID" value={<MonoId id={arrival.id} />} mono />
+        <InfoRow label="Supplier" value={arrival.supplierName} />
+        <InfoRow label="Delivery Date" value={`${fmtDate(arrival.expectedDate)} · ${arrival.expectedTime}`} />
+        {arrival.destination && <InfoRow label="Destination" value={arrival.destination} />}
+      </div>
+
+      {isEmpty ? (
+        <div className="rounded-xl bg-amber-50 border border-amber-200 p-4 text-xs text-amber-800">
+          <div className="flex gap-2"><AlertCircle size={15} className="shrink-0 mt-0.5 text-amber-600" />
+            <div>
+              <p className="font-semibold text-amber-900 mb-1">No accepted stock is available to receive yet.</p>
+              <p className="text-amber-700">This delivery has no quantity passed forward by the Receiving/Checker. Accepted quantities appear here once the checker transaction is recorded.</p>
+            </div>
+          </div>
+        </div>
+      ) : fullyReceived ? (
+        <div className="rounded-xl bg-green-50 border border-green-200 p-4 text-xs text-green-800">
+          <div className="flex gap-2"><CheckCircle2 size={15} className="shrink-0 mt-0.5 text-green-600" />
+            <div>
+              <p className="font-semibold text-green-900 mb-1">This delivery is fully received and read-only.</p>
+              <p className="text-green-700">
+                {requiredTotal.toLocaleString()} required units have been acknowledged by the Vendor
+                {latestReceiving ? <> · Received By <strong>{latestReceiving.receivedBy}</strong> on {fmtDateTime(latestReceiving.receivedAt)}</> : null}.
+              </p>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {/* Item & Quantity */}
+          <div className="rounded-xl border border-slate-200 overflow-hidden">
+            <div className="px-3.5 pt-3.5"><SectionTitle><PackageCheck size={13} />Item Information</SectionTitle></div>
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-400">
+                  <th className="text-left font-bold px-3.5 py-2">Product</th>
+                  <th className="text-right font-bold px-2 py-2">Original</th>
+                  <th className="text-right font-bold px-2 py-2">Accepted</th>
+                  <th className="text-right font-bold px-2 py-2">Available</th>
+                  <th className="text-right font-bold px-3.5 py-2">Received Qty</th>
+                </tr>
+              </thead>
+              <tbody>
+                {receiveableItems.map(it => {
+                  const available = Math.max(0, it.availableQty ?? 0);
+                  const accepted = it.acceptedQty ?? 0;
+                  const damaged = it.damagedQty ?? 0;
+                  const received = it.vendorReceived ?? 0;
+                  const key = `${it.productName}::${it.unit}`;
+                  return (
+                    <tr key={key} className="border-t border-slate-100">
+                      <td className="px-3.5 py-2.5 align-top">
+                        <p className="font-semibold text-slate-700 leading-tight">{it.productName}</p>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          {Number(it.qty ?? 0).toLocaleString()} required · {accepted.toLocaleString()} accepted · {received.toLocaleString()} already received · {(Math.max(0, Number(it.qty ?? 0) - received)).toLocaleString()} remaining
+                          {damaged > 0 && <span className="text-red-500"> · {damaged.toLocaleString()} damaged</span>}
+                        </p>
+                      </td>
+                      <td className="px-2 py-2.5 text-right text-slate-500 whitespace-nowrap">{Number(it.qty ?? 0).toLocaleString()}</td>
+                      <td className="px-2 py-2.5 text-right font-semibold text-slate-700 whitespace-nowrap">{accepted.toLocaleString()}</td>
+                      <td className="px-2 py-2.5 text-right font-semibold text-[#5b21b6] whitespace-nowrap">{available.toLocaleString()}</td>
+                      <td className="px-3.5 py-2.5">
+                        {available > 0 ? (
+                          <input
+                            type="number" min={0} max={available} step="any"
+                            value={lines[key] ?? ""}
+                            onChange={e => setLine(key, e.target.value)}
+                            disabled={busy}
+                            className={`${inp} min-h-0 py-1.5 text-sm text-right w-28 ml-auto`}
+                          />
+                        ) : <span className="text-xs text-slate-400 block text-right">Fully received</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Receiving Information */}
+          <div className="rounded-xl border border-slate-200 p-3.5">
+            <SectionTitle><PackageCheck size={13} />Receiving Information</SectionTitle>
+            <InfoRow label="Current Receiving Status" value={supplyStatusCfg(arrival.status)?.label ?? arrival.status} />
+            <InfoRow label="Received By" value={<span className="inline-flex items-center gap-1.5"><Users size={13} className="text-slate-400" />{receivedBy || <span className="text-amber-600">No display name set on this account</span>}</span>} />
+            <InfoRow label="Received Date & Time" value={
+              <span className="inline-flex items-center gap-1.5"><Clock size={13} className="text-slate-400" />{fmtDateTime(now.toISOString())} <span className="text-[10px] font-normal text-slate-400">(server timestamp on confirm)</span></span>
+            } />
+            <InfoRow label="Received Quantity" value={<span className="font-bold text-slate-900">{receivingTotal.toLocaleString()}</span>} />
+            <div className="pt-2">
+              <label className="text-xs font-bold text-slate-700 mb-1.5 block">Receiving Remarks <span className="text-slate-400 font-normal">(optional)</span></label>
+              <textarea className={`${inp} resize-none`} rows={2} maxLength={500} value={remarks} onChange={e => setRemarks(e.target.value)} disabled={busy} placeholder="Receiving notes — e.g. Received and acknowledged in good condition." />
+            </div>
+          </div>
+
+          {/* Linked Documents */}
+          <div className="rounded-xl border border-slate-200 overflow-hidden">
+            <div className="px-3.5 pt-3.5"><SectionTitle><FileText size={13} />Linked Documents</SectionTitle></div>
+            {documents.length === 0 ? (
+              <p className="px-3.5 pb-3.5 text-xs text-slate-400">{docErr || "No linked delivery documents for this supply chain transaction."}</p>
+            ) : (
+              <ul className="divide-y divide-slate-100">
+                {documents.map(d => (
+                  <li key={d.id} className="flex items-center justify-between gap-3 px-3.5 py-2.5">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-slate-700 truncate">{d.name}</p>
+                      <p className="text-[11px] text-slate-400">{fmtDateTime(d.uploadedAt)} · {fmtSize(d.sizeBytes)}</p>
+                    </div>
+                    <Btn variant="ghost" size="sm" onClick={() => void handleViewDoc(d)} disabled={busy}><Eye size={13} /> View</Btn>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="px-3.5 pb-3 text-[11px] text-slate-400">Existing delivery documents are shown for reference only.</p>
+          </div>
+        </div>
+      )}
+
+      {err && <div className="mt-3 bg-red-50 border border-red-200 rounded-xl p-3 flex gap-2 text-xs text-red-600"><AlertCircle size={14} className="shrink-0 mt-0.5" />{err}</div>}
+    </Modal>
   );
 };
 
 /* ── supply monitoring ─────────────────────────────────── */
 
-const SupplyMonitoring = ({ data, actions, startReceiving, goTo }: {
-  data: VendorData; actions: VendorActions; startReceiving: (id?: string) => void; goTo: (p: Page) => void;
+const SupplyMonitoring = ({ data, actions, goTo }: {
+  data: VendorData; actions: VendorActions; goTo: (p: Page) => void;
 }) => {
-  const [filter, setFilter] = React.useState<SupplyStatus | "all">("all");
   const [q, setQ] = React.useState("");
+  const [filter, setFilter] = React.useState<"all" | SupplyStatus>("all");
+  const [receivingAck, setReceivingAck] = React.useState<SupplyArrival | null>(null);
 
   const ACTIVE_CLS: Record<SupplyStatus, string> = {
     expected: "bg-sky-500",
-    for_receiving: "bg-amber-500",
-    received: "bg-indigo-500",
+    pending: "bg-amber-500",
     partially_received: "bg-orange-500",
     completed: "bg-green-600",
-    rejected_damaged: "bg-red-500",
   };
 
-  const statuses: SupplyStatus[] = ["expected", "for_receiving", "partially_received", "received", "completed", "rejected_damaged"];
+  const statuses: SupplyStatus[] = ["expected", "pending", "partially_received", "completed"];
 
   const filtered = data.arrivals.filter(a => {
     const matchF = filter === "all" || a.status === filter;
@@ -1704,7 +1814,6 @@ const SupplyMonitoring = ({ data, actions, startReceiving, goTo }: {
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
         {filtered.map(a => {
-          const qty = arrivalReceivedQty(a.id, data.receipts);
           const bad = arrivalHasIssue(a.id, data.receipts);
           return (
             <Card key={a.id} className="p-5 flex flex-col">
@@ -1714,31 +1823,24 @@ const SupplyMonitoring = ({ data, actions, startReceiving, goTo }: {
               </div>
               <div className="space-y-1 text-xs text-slate-500 mb-3">
                 {a.items.map((i, idx) => (
-                  <div key={idx} className="flex justify-between gap-2"><span className="truncate">{i.productName}</span><span className="font-semibold text-slate-700 shrink-0">{i.qty.toLocaleString()} {i.unit}</span></div>
+                  <div key={idx} className="flex justify-between gap-2">
+                    <span className="truncate">{i.productName}</span>
+                    <span className="font-semibold text-slate-700 shrink-0">{i.qty.toLocaleString()} {i.unit}</span>
+                  </div>
                 ))}
                 <div className="flex justify-between pt-1"><span>Expected</span><span>{fmtDate(a.expectedDate)} {a.expectedTime}</span></div>
                 <div className="flex justify-between"><span>Destination</span><span className="truncate">{a.destination}</span></div>
                 {a.sourceRef && <div className="flex justify-between"><span>Delivery Schedule</span><span className="font-mono text-[11px] text-slate-400">{a.sourceRef}</span></div>}
               </div>
-              <ProgressBar received={qty} total={a.totalQty} bad={bad} />
-              {a.remarks && <p className="text-[11px] text-slate-400 mt-2 italic truncate">{a.remarks}</p>}
+              <ProgressBar received={(a.receivedQty ?? 0)} total={a.requiredQty ?? a.totalQty} bad={bad} />
+              {(a.requiredQty ?? a.totalQty) > 0 && (
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Checker accepted {(a.acceptedQty ?? 0).toLocaleString()} · vendor received {(a.receivedQty ?? 0).toLocaleString()} · {(a.remainingQty ?? 0).toLocaleString()} remaining
+                </p>
+              )}
               <div className="mt-3 pt-3 border-t border-slate-100 flex gap-2 flex-wrap">
-                {a.status === "expected" && <Btn size="sm" className="flex-1" onClick={() => { if (confirm(`Mark ${a.id} as available for receiving?`)) actions.updateArrivalStatus(a.id, "for_receiving"); }}><Truck size={13} /> Mark For Receiving</Btn>}
-                {a.status === "for_receiving" && <Btn size="sm" className="flex-1" onClick={() => startReceiving(a.id)}><PackagePlus size={13} /> Receive Now</Btn>}
-                {a.status === "partially_received" && <Btn size="sm" className="flex-1" onClick={() => startReceiving(a.id)}><RefreshCw size={13} /> Record Balance</Btn>}
-                {a.status === "received" && (
-                  <>
-                    <Btn size="sm" variant="secondary" className="flex-1" onClick={() => goTo("history")}><Eye size={13} /> Receipts</Btn>
-                    <Btn size="sm" className="flex-1" onClick={() => { if (confirm(`Complete receiving for ${a.id} and forward to inventory?`)) actions.updateArrivalStatus(a.id, "completed"); }}><PackageCheck size={13} /> Complete</Btn>
-                  </>
-                )}
-                {a.status === "completed" && <p className="text-xs text-slate-400 py-2">Closed — forwarded to inventory.</p>}
-                {a.status === "rejected_damaged" && (
-                  <>
-                    <p className="text-[11px] text-red-500 py-1 italic">Supply had issues — awaiting SC resolution / replacement.</p>
-                    <Btn size="sm" variant="secondary" className="flex-1" onClick={() => { if (confirm(`Reopen ${a.id} for receiving (e.g. replacement delivery)?`)) actions.updateArrivalStatus(a.id, "for_receiving"); }}><RefreshCw size={13} /> Reopen</Btn>
-                  </>
-                )}
+                {((a.acceptedQty ?? 0) > (a.receivedQty ?? 0)) && <Btn size="sm" className="flex-1" onClick={() => setReceivingAck(a)}><PackageCheck size={13} /> Record Received</Btn>}
+                {a.status === "completed" && <Btn size="sm" variant="secondary" className="flex-1" onClick={() => goTo("history")}><PackageCheck size={13} /> View Receiving History</Btn>}
               </div>
             </Card>
           );
@@ -1779,11 +1881,15 @@ const SupplyMonitoring = ({ data, actions, startReceiving, goTo }: {
           {avSummary.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No good-condition receipts recorded yet.</p>}
         </div>
       </Card>
+{receivingAck && (
+        <RecordReceivedModal
+          arrival={receivingAck} data={data} actions={actions}
+          onClose={() => setReceivingAck(null)}
+        />
+      )}
     </div>
   );
 };
-
-/* ── suppliers (from Supply Chain) ──────────────────────── */
 
 const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions }) => {
   const [q, setQ] = React.useState("");
@@ -1923,6 +2029,7 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
   const [filteredRows, setFilteredRows] = React.useState<SupplyReceipt[] | null>(null);
   const [sortDir, setSortDir] = React.useState<"new" | "old">("new");
   const [reportOpen, setReportOpen] = React.useState(false);
+  const [pdfView, setPdfView] = React.useState<{ pdfBase64: string; filename: string } | null>(null);
 
   const openReport = () => {
     const f = from.trim();
@@ -2107,7 +2214,8 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
       </Card>
 
       <ReceiptDetailsModal rec={viewing} onClose={() => setViewing(null)} />
-      <ReportPasswordModal open={reportOpen} onClose={() => setReportOpen(false)} from={from} to={to} />
+      <ReportPasswordModal open={reportOpen} onClose={() => setReportOpen(false)} from={from} to={to} onPdfGenerated={(b, fn) => setPdfView({ pdfBase64: b, filename: fn })} />
+      <PdfViewerModal data={pdfView} onClose={() => setPdfView(null)} />
     </div>
   );
 };

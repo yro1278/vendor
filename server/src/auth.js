@@ -115,7 +115,7 @@ export async function requireVendor(req, _res, next) {
     }
 
     const [users] = await pool.query(
-      "SELECT u.id, u.username, u.role, u.vendor_id, v.is_active AS vendor_active FROM users u LEFT JOIN vendors v ON v.id = u.vendor_id WHERE u.id = ?",
+      "SELECT u.id, u.username, u.display_name, u.role, u.vendor_id, v.is_active AS vendor_active FROM users u LEFT JOIN vendors v ON v.id = u.vendor_id WHERE u.id = ?",
       [payload.sub]
     );
     if (users.length === 0) throw httpError(401, "Unauthorized — account no longer exists.");
@@ -131,7 +131,7 @@ export async function requireVendor(req, _res, next) {
       throw httpError(403, "The vendor account is inactive.");
     }
 
-    req.user = { sub: Number(user.id), username: user.username, role: user.role, vendorId: String(user.vendor_id) };
+    req.user = { sub: Number(user.id), username: user.username, displayName: user.display_name ?? user.username, role: user.role, vendorId: String(user.vendor_id) };
     return next();
   } catch (err) {
     return next(err);

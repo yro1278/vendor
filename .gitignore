@@ -1,7 +1,12 @@
 # Logs
 logs
 *.log
+*.pid
 npm-debug.log*
+
+# Uploaded document storage (runtime)
+server/uploads/
+uploads/
 
 # Dependency directories
 node_modules

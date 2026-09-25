@@ -1,4 +1,6 @@
 import bcrypt from "bcryptjs";
+import { join } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
 import { pool } from "./pool.js";
 import { DEFAULT_VENDOR_ID } from "./constants.js";
 
@@ -111,7 +113,7 @@ const SEED_ARRIVALS = [
     expectedTime: "9:00 AM",
     destination: "Tri-M MDC — Warehouse A",
     remarks: "Delivery truck arrived at site.",
-    status: "for_receiving",
+    status: "pending",
     created: isoToDb(day(-2, 9)),
   },
   {
@@ -156,7 +158,7 @@ const SEED_ARRIVALS = [
     expectedTime: "11:00 AM",
     destination: "Tri-M MDC — Warehouse A",
     remarks: "Physical count verified.",
-    status: "received",
+    status: "completed",
     created: isoToDb(day(-3, 9)),
   },
   {
@@ -170,7 +172,7 @@ const SEED_ARRIVALS = [
     expectedTime: "7:30 AM",
     destination: "Tri-M MDC — Cold Storage",
     remarks: "Cold chain broke in transit; returned to supplier; replacement scheduled.",
-    status: "rejected_damaged",
+    status: "pending",
     created: isoToDb(day(-5, 9)),
   },
 ];
@@ -244,13 +246,67 @@ const SEED_RECEIPTS = [
   },
 ];
 
+/* Replacement requests seeded for demo. The replacement quantity is DERIVED
+   (Expected − Accepted good on original receipts) — the demo numbers below
+   mirror the seeded receipts so the math is consistent on a fresh database. */
+const SEED_REPLACEMENTS = [
+  {
+    id: "RPL-2026-0112",
+    arrivalId: "SC-DLV-2026-0272",
+    productName: "Frozen Shrimp Vannamei (HLSO)",
+    unit: "kg",
+    expectedQty: 150,
+    acceptedQty: 0,
+    damagedQty: 150,
+    replacementQty: 150,
+    reason: "Cold chain broke in transit; full shipment rejected.",
+    remarks: "Supplier coordinating replacement delivery.",
+    status: "requested",
+    requestedBy: "R. Dela Cruz",
+    requestedAt: isoToDb(day(-4, 10)),
+  },
+];
+
+/* Vendor Receiving acknowledgments seeded for demo. Each row records ACCEPTED
+   stock the Vendor has confirmed receiving; the arrival status is derived from
+   accepted vs received (see syncArrivalStatus). */
+const SEED_VENDOR_RECEIVINGS = [
+  {
+    id: "VRC-2026-0001",
+    arrivalId: "SC-DLV-2026-0311",
+    receivedBy: "M. Santos",
+    receivedAt: isoToDb(day(-1, 15)),
+    remarks: "All accepted stock received and forwarded to inventory.",
+    items: [
+      { productName: "Korean BB Cream SPF 50+", unit: "pcs", qty: 200 },
+      { productName: "Hyaluronic Acid Serum 30ml", unit: "pcs", qty: 120 },
+    ],
+  },
+  {
+    id: "VRC-2026-0002",
+    arrivalId: "SC-DLV-2026-0298",
+    receivedBy: "M. Santos",
+    receivedAt: isoToDb(day(-2, 15)),
+    remarks: "Partial acknowledgement; remaining accepted stock still on the dock.",
+    items: [{ productName: "Canned Sardines 155g", unit: "pcs", qty: 1000 }],
+  },
+  {
+    id: "VRC-2026-0003",
+    arrivalId: "SC-DLV-2026-0287",
+    receivedBy: "L. Villanueva",
+    receivedAt: isoToDb(day(-1, 12)),
+    remarks: "Accepted stock received in full.",
+    items: [{ productName: "Matte Lipstick Trio", unit: "pcs", qty: 120 }],
+  },
+];
+
 const SEED_NOTIFS = [
   { id: "N-001", title: "Supply Available for Receiving", message: "SC-DLV-2026-0334 (Pacific Dry Goods) arrived and is ready for receiving at Warehouse A.", type: "info", read: false, created: isoToDb(day(0, 9)) },
   { id: "N-002", title: "Expected Supply Incoming", message: "SC-DLV-2026-0338 (Pacific Fresh Distributors) expected delivery tomorrow at Cold Storage.", type: "info", read: true, created: isoToDb(day(-1, 16)) },
-  { id: "N-003", title: "Receiving Recorded", message: "Received 1,500 pcs canned sardines; 500 pcs still pending from Pacific Dry (SC-DLV-2026-0298).", type: "warning", read: true, created: isoToDb(day(-3, 15)) },
-  { id: "N-004", title: "Damaged Supply Rejected", message: "Frozen shrimp delivery rejected — cold chain broke in transit (SC-DLV-2026-0272).", type: "error", read: true, created: isoToDb(day(-4, 15)) },
-  { id: "N-005", title: "Receiving Completed", message: "Korean BB Cream & HA Serum receiving completed and forwarded to inventory (RR-2026-0081).", type: "success", read: true, created: isoToDb(day(-1, 14)) },
-  { id: "N-006", title: "Damaged Items Recorded", message: "100 pcs canned sardines received — 50 good, 50 damaged during inspection (RR-2026-0085).", type: "warning", read: false, created: isoToDb(day(0, 11)) },
+  { id: "N-003", title: "Vendor Received Partial", message: "Vendor acknowledged 1,000 of 1,550 accepted pcs for SC-DLV-2026-0298. 550 pcs remain on the receiving dock.", type: "warning", read: false, created: isoToDb(day(-2, 16)) },
+  { id: "N-004", title: "Replacement Requested", message: "Frozen shrimp delivery damaged in transit — 150 kg rejected, replacement requested (SC-DLV-2026-0272).", type: "warning", read: true, created: isoToDb(day(-4, 15)) },
+  { id: "N-005", title: "Vendor Receiving Completed", message: "SC-DLV-2026-0311 fully received — 320 accepted pcs forwarded to inventory (VRC-2026-0001).", type: "success", read: true, created: isoToDb(day(-1, 15)) },
+  { id: "N-006", title: "Damaged Items Recorded", message: "100 pcs canned sardines inspected — 50 good, 50 damaged during inspection (RR-2026-0085).", type: "warning", read: false, created: isoToDb(day(0, 11)) },
 ];
 
 /* Supply requests seeded for demo/tracking. Fulfillment numbers are NOT stored —
@@ -409,14 +465,40 @@ export async function seedIfEmpty() {
   for (const r of SEED_RECEIPTS) {
     await pool.query(
       `INSERT INTO receipts
-        (id, arrival_id, supplier_id, supplier_name, status, total_qty, received_at, receiving_by, doc_ref, remarks, vendor_id)
-       VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, ?)`,
+        (id, arrival_id, supplier_id, supplier_name, status, total_qty, received_at, receiving_by, doc_ref, remarks, vendor_id, kind)
+       VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, ?, 'original')`,
       [r.id, r.arrivalId, r.supplierId, r.supplierName, r.totalQty, r.receivedAt, r.receivingBy, r.docRef, r.remarks, DEFAULT_VENDOR_ID]
     );
     for (const it of r.items) {
       await pool.query(
-        "INSERT INTO receipt_items (receipt_id, product_name, qty, total_received_quantity, unit, condition_value) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO receipt_items (receipt_id, product_name, qty, total_received_quantity, unit, condition_value, return_to_sc) VALUES (?, ?, ?, ?, ?, ?, 0)",
         [r.id, it.productName, it.qty, it.totalReceived ?? it.qty, it.unit, it.condition]
+      );
+    }
+  }
+
+  for (const rpl of SEED_REPLACEMENTS) {
+    await pool.query(
+      `INSERT INTO replacement_requests
+        (id, arrival_id, product_name, unit, expected_qty, accepted_qty, damaged_qty,
+         replacement_qty, reason, remarks, status, requested_by, requested_at, vendor_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [rpl.id, rpl.arrivalId, rpl.productName, rpl.unit, rpl.expectedQty, rpl.acceptedQty,
+        rpl.damagedQty, rpl.replacementQty, rpl.reason, rpl.remarks, rpl.status,
+        rpl.requestedBy, rpl.requestedAt, DEFAULT_VENDOR_ID]
+    );
+  }
+
+  for (const v of SEED_VENDOR_RECEIVINGS) {
+    await pool.query(
+      `INSERT INTO vendor_receivings (id, arrival_id, received_by, received_at, remarks, vendor_id)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [v.id, v.arrivalId, v.receivedBy, v.receivedAt, v.remarks, DEFAULT_VENDOR_ID]
+    );
+    for (const it of v.items) {
+      await pool.query(
+        "INSERT INTO vendor_receiving_items (receiving_id, arrival_id, product_name, unit, received_qty) VALUES (?, ?, ?, ?, ?)",
+        [v.id, v.arrivalId, it.productName, it.unit, it.qty]
       );
     }
   }
@@ -429,4 +511,63 @@ export async function seedIfEmpty() {
   }
 
   console.log("[seed] Reference data inserted.");
+}
+
+/* Builds a minimal but valid single-page PDF so demo delivery documents can
+   be opened/downloaded in the receiving form. */
+const makePdfDoc = (title) => {
+  const safe = String(title).replace(/[()\\]/g, "\\$&");
+  const content = `BT /F1 20 Tf 72 720 Td (${safe}) Tj ET\nBT /F1 12 Tf 72 692 Td (Supply Chain delivery document) Tj ET`;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+    `<< /Length ${Buffer.byteLength(content, "latin1")} >>\nstream\n${content}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [];
+  objects.forEach((obj, i) => {
+    offsets.push(Buffer.byteLength(pdf, "latin1"));
+    pdf += `${i + 1} 0 obj\n${obj}\nendobj\n`;
+  });
+  const xrefStart = Buffer.byteLength(pdf, "latin1");
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const off of offsets) pdf += `${String(off).padStart(10, "0")} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF\n`;
+  return Buffer.from(pdf, "latin1");
+};
+
+/* Demonstrate the SC-delivery → receiving document relationship: attach a
+   couple of PDFs to the demo deliveries so the receiving form can show them
+   coming from MySQL. Idempotent — never duplicates per arrival. */
+export async function seedDeliveryDocuments() {
+  const [existing] = await pool.query(
+    "SELECT arrival_id FROM delivery_documents WHERE arrival_id IS NOT NULL GROUP BY arrival_id"
+  );
+  const already = new Set(existing.map((r) => r.arrival_id));
+
+  const specs = [
+    { arrivalId: "SC-DLV-2026-0298", name: "Delivery Receipt.pdf" },
+    { arrivalId: "SC-DLV-2026-0298", name: "Supporting Document.pdf" },
+    { arrivalId: "SC-DLV-2026-0334", name: "Purchase/Delivery Document.pdf" },
+    { arrivalId: "SC-DLV-2026-0311", name: "Delivery Receipt.pdf" },
+  ];
+
+  const root = join(process.cwd(), "uploads", "deliveries", DEFAULT_VENDOR_ID);
+  await mkdir(root, { recursive: true }).catch(() => {});
+  let inserted = 0;
+  for (const s of specs) {
+    if (already.has(s.arrivalId)) continue;
+    const storedName = `seed-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.pdf`;
+    const buffer = makePdfDoc(`${s.name} · ${s.arrivalId}`);
+    await writeFile(join(root, storedName), buffer);
+    await pool.query(
+      `INSERT INTO delivery_documents (arrival_id, original_name, stored_name, mime_type, size_bytes, uploaded_by)
+       VALUES (?, ?, ?, 'application/pdf', ?, NULL)`,
+      [s.arrivalId, s.name, storedName, buffer.length]
+    );
+    inserted += 1;
+  }
+  if (inserted > 0) console.log(`[seed] Attached ${inserted} document(s) to demo SC deliveries.`);
 }

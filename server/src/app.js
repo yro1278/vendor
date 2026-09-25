@@ -28,9 +28,10 @@ app.use((err, _req, res, _next) => {
   const isDbUnavailable =
     err &&
     ["ECONNREFUSED", "ETIMEDOUT", "ECONNRESET", "PROTOCOL_CONNECTION_LOST"].includes(err.code);
+  const isMulterError = err && (err.name === "MulterError" || /^File type not allowed/.test(err.message ?? ""));
   const status = isDbUnavailable
     ? 503
-    : err.status || (err && err.code === "ER_DUP_ENTRY" ? 409 : 500);
+    : err.status || (err && err.code === "ER_DUP_ENTRY" ? 409 : isMulterError ? 400 : 500);
   if (status >= 500) console.error(err);
   res.status(status).json({
     ...(err?.extra?.errors ? { errors: err.extra.errors } : {}),

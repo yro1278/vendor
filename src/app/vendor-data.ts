@@ -23,13 +23,86 @@ export type ProductCategory = "Dry Products" | "Frozen Products" | "Cosmetic Pro
 
 export type SupplyStatus =
   | "expected"
-  | "for_receiving"
-  | "received"
+  | "pending"
   | "partially_received"
-  | "completed"
-  | "rejected_damaged";
+  | "completed";
 
 export type ReceiptCondition = "good" | "damaged" | "rejected";
+
+/* Status of a replacement request — a SEPARATE workflow from receiving.
+   Requested is opened by the Vendor; APPROVED → FOR DELIVERY → DELIVERED are
+   moved by the Supply Chain subsystem; RECEIVED / COMPLETED reflect units the
+   Vendor physically received against the request; CANCELLED means voided. */
+export type ReplacementStatus =
+  | "requested"
+  | "approved"
+  | "for_delivery"
+  | "delivered"
+  | "received"
+  | "completed"
+  | "cancelled";
+
+/* Replacement request for a product whose original receipt fell short of the
+   expected quantity (damaged / rejected / short shipment). The quantity is
+   always derived by the system: Replacement Required = Expected − Accepted. */
+export interface ReplacementRequest {
+  id: string;
+  arrivalId: string;
+  arrivalRef: string;             /* SC-SCHED-… source reference for the delivery */
+  supplierId: string;
+  supplierName: string;
+  productName: string;
+  unit: string;
+  expectedQty: number;
+  acceptedQty: number;            /* GOOD units accepted on the original receipt */
+  damagedQty: number;             /* damaged + rejected units on the original receipt */
+  replacementQty: number;         /* derived: max(0, expected − accepted) */
+  receivedQty: number;            /* good units received against this request */
+  remainingQty: number;           /* replacementQty − receivedQty */
+  reason: string;
+  remarks: string;
+  status: ReplacementStatus;
+  requestedBy: string;
+  requestedAt: string;
+  createdAt: string;
+}
+
+/* A Vendor Receiving acknowledgment. Records receipt of ACCEPTED stock (the
+   Checker/Inspection result). Partial acknowledgments stack until every
+   accepted unit is covered → the delivery becomes COMPLETED. */
+export interface VendorReceivingItem {
+  productName: string;
+  unit: string;
+  qty: number;
+}
+
+export interface VendorReceiving {
+  id: string;
+  arrivalId: string;
+  arrivalRef: string;
+  supplierId: string;
+  supplierName: string;
+  receivedBy: string;
+  receivedAt: string;
+  remarks: string;
+  items: VendorReceivingItem[];
+}
+
+/* A discrepancy report filed against an inspection/delivery. The Vendor can
+   never modify the Checker's quantities — disputes ride this traceable channel. */
+export interface DiscrepancyReport {
+  id: string;
+  arrivalId: string;
+  arrivalRef: string;
+  supplierName: string;
+  receiptId: string | null;
+  discrepancyType: string;
+  description: string;
+  requestedCorrection: string;
+  status: string;
+  reportedBy: string;
+  reportedAt: string;
+}
 
 export interface Product {
   id: string;
@@ -64,6 +137,36 @@ export interface SupplyItem {
   productName: string;
   qty: number;
   unit: string;
+  /* Receiving math derived server-side per delivery product:
+     accepted = GOOD units across all receipts; only good enters stock.
+     replacementRequired = Expected − Accepted(good on original receipts);
+     replacementReceived = good units received against replacement requests. */
+  acceptedQty?: number;
+  damagedQty?: number;
+  /* Vendor accepting math derived server-side per delivery product:
+     vendorReceived = units already acknowledged by the Vendor;
+     availableQty = acceptedQty − vendorReceived (for partial receiving);
+     requiredQty = original expected quantity of this product;
+     remainingQty = requiredQty − vendorReceived (units still owed vs original). */
+  vendorReceived?: number;
+  availableQty?: number;
+  requiredQty?: number;
+  remainingQty?: number;
+  replacementRequired?: number;
+  replacementReceived?: number;
+  replacementRemaining?: number;
+  fulfilled?: boolean;
+}
+
+/* A document that travels with a Supply Chain delivery. The receiving form
+   reads these from the linked arrival — the vendor never re-types references
+   or re-uploads SC documents. */
+export interface SupplyDeliveryDocument {
+  id: number;
+  name: string;
+  sizeBytes: number;
+  mimeType: string;
+  uploadedAt: string;
 }
 
 /* Expected / pending supply notified by the Supply Chain subsystem.
@@ -80,7 +183,17 @@ export interface SupplyArrival {
   destination: string;            /* receiving site / warehouse */
   remarks: string;
   status: SupplyStatus;
+  docs: SupplyDeliveryDocument[]; /* documents supplied by the SC delivery */
   createdAt: string;
+  /* Fulfillment math derived server-side per delivery (authoritative):
+     requiredQty = original expected total (sum of item.qty);
+     acceptedQty = GOOD checker-received total;
+     receivedQty = cumulative Vendor acknowledgment total;
+     remainingQty = requiredQty − receivedQty (still owed vs original). */
+  requiredQty?: number;
+  acceptedQty?: number;
+  receivedQty?: number;
+  remainingQty?: number;
 }
 
 export interface ReceiptItem {
@@ -89,6 +202,7 @@ export interface ReceiptItem {
   totalQty?: number;              /* total received quantity for the product/unit (GOOD + DAMAGED) */
   unit: string;
   condition: ReceiptCondition;
+  returnToSc?: boolean;           /* damaged/rejected units marked "return to Supply Chain" */
 }
 
 /* A receiving transaction — the core record of this module. */
@@ -103,6 +217,9 @@ export interface SupplyReceipt {
   receivingBy: string;
   docRef: string;                 /* document / reference number (delivery receipt, waybill, DR no.) */
   remarks: string;
+  kind: "original" | "replacement";
+  replacementRequestId: string | null;
+  conditionSummary?: { good: number; damaged: number; rejected: number };
 }
 
 export interface AppNotification {
@@ -195,11 +312,28 @@ export const UNIT_OPTIONS = ["pcs", "box", "case", "sack", "bag", "kg", "L", "pa
 
 export const SUPPLY_STATUS_CFG: Record<SupplyStatus, { label: string; cls: string; dot: string }> = {
   expected:           { label: "Expected",           cls: "bg-sky-50 text-sky-700 border-sky-200",    dot: "bg-sky-500" },
-  for_receiving:      { label: "For Receiving",      cls: "bg-amber-50 text-amber-700 border-amber-200", dot: "bg-amber-500" },
-  received:           { label: "Received",           cls: "bg-indigo-50 text-indigo-700 border-indigo-200", dot: "bg-indigo-500" },
+  pending:            { label: "Pending",            cls: "bg-amber-50 text-amber-700 border-amber-200", dot: "bg-amber-500" },
   partially_received: { label: "Partially Received", cls: "bg-orange-50 text-orange-700 border-orange-200", dot: "bg-orange-500" },
   completed:          { label: "Completed",          cls: "bg-green-50 text-green-700 border-green-200", dot: "bg-green-500" },
-  rejected_damaged:   { label: "Rejected / Damaged", cls: "bg-red-50 text-red-700 border-red-200",    dot: "bg-red-500" },
+};
+
+/* A server may still be serving legacy status values (for_receiving, received,
+   rejected_damaged) while this UI builds the new status model. Every lookup
+   must go through supplyStatusCfg() so an unknown value renders a neutral
+   badge instead of crashing the whole view. */
+const UNKNOWN_STATUS_CFG = { label: "Processing", cls: "bg-slate-50 text-slate-500 border-slate-200", dot: "bg-slate-400" };
+
+export const supplyStatusCfg = (status: string): { label: string; cls: string; dot: string } =>
+  SUPPLY_STATUS_CFG[status as SupplyStatus] ?? UNKNOWN_STATUS_CFG;
+
+export const REPLACEMENT_STATUS_CFG: Record<ReplacementStatus, { label: string; cls: string; dot: string }> = {
+  requested:   { label: "Requested",   cls: "bg-sky-50 text-sky-700 border-sky-200",       dot: "bg-sky-500" },
+  approved:    { label: "Approved",    cls: "bg-violet-50 text-violet-700 border-violet-200", dot: "bg-violet-500" },
+  for_delivery: { label: "For Delivery", cls: "bg-indigo-50 text-indigo-700 border-indigo-200", dot: "bg-indigo-500" },
+  delivered:   { label: "Delivered",   cls: "bg-cyan-50 text-cyan-700 border-cyan-200",     dot: "bg-cyan-500" },
+  received:    { label: "Received",    cls: "bg-amber-50 text-amber-700 border-amber-200",  dot: "bg-amber-500" },
+  completed:   { label: "Completed",   cls: "bg-green-50 text-green-700 border-green-200",   dot: "bg-green-500" },
+  cancelled:   { label: "Cancelled",   cls: "bg-slate-50 text-slate-500 border-slate-200",   dot: "bg-slate-400" },
 };
 
 export const CONDITION_LABEL: Record<ReceiptCondition, string> = {
@@ -251,10 +385,23 @@ export const fmtTime = (s: string) => {
 export const arrivalReceivedQty = (arrivalId: string, receipts: SupplyReceipt[]) =>
   receipts.filter(r => r.arrivalId === arrivalId).reduce((a, r) => a + r.totalQty, 0);
 
+/* GOOD units accepted so far for a delivery (stock-relevant, across receipts). */
+export const arrivalAcceptedGood = (arrivalId: string, receipts: SupplyReceipt[]) =>
+  receipts
+    .filter(r => r.arrivalId === arrivalId)
+    .reduce((a, r) => a + r.items.filter(i => i.condition === "good").reduce((b, i) => b + i.qty, 0), 0);
+
 export const arrivalHasIssue = (arrivalId: string, receipts: SupplyReceipt[]) =>
   receipts.some(r => r.arrivalId === arrivalId && r.items.some(i => i.condition !== "good"));
 
 export const receiptHasIssue = (rec: SupplyReceipt) => rec.items.some(i => i.condition !== "good");
+
+/* ACCEPTED stock the Vendor has acknowledged receiving so far for a delivery
+   (sum of vendor_receiving_items rows). */
+export const arrivalVendorReceivedQty = (arrivalId: string, vendorReceivings: VendorReceiving[]) =>
+  vendorReceivings
+    .filter(v => v.arrivalId === arrivalId)
+    .reduce((a, v) => a + v.items.reduce((b, i) => b + i.qty, 0), 0);
 
 export const supplierReceivedQty = (supplierId: string, receipts: SupplyReceipt[]) =>
   receipts.filter(r => r.supplierId === supplierId).reduce((a, r) => a + r.totalQty, 0);
@@ -322,11 +469,17 @@ export interface VendorData {
   notifications: AppNotification[];
   supplyRequests: SupplyRequest[];
   products: Product[];        /* product master (existing supplier_products records) */
+  replacementRequests: ReplacementRequest[];
+  vendorReceivings: VendorReceiving[];
+  discrepancyReports: DiscrepancyReport[];
 }
 
 export interface VendorActions {
-  recordReceipt: (rec: SupplyReceipt) => Promise<{ ok: boolean; error?: string; errors?: Record<string, string> }>;
-  updateArrivalStatus: (id: string, status: SupplyStatus) => void;
+  /* The Vendor is the FINAL RECEIVER only. It never records inspections,
+     reopens deliveries, opens replacement requests, or reports discrepancies —
+     those belong to the Receiving/Checker subsystem. The only receiving action
+     on the Vendor side is acknowledging the already-accepted stock. */
+  confirmVendorReceiving: (arrivalId: string, input: { id: string; items: { productName: string; unit: string; qty: number }[]; receivedAt: string; receivingBy: string; remarks: string }) => Promise<{ ok: boolean; error?: string }>;
   toggleSupplierActive: (id: string) => void;
   markNotifRead: (id: string) => void;
   markAllNotifsRead: () => void;
@@ -336,24 +489,8 @@ export interface VendorActions {
   submitSupplyRequest: (id: string) => Promise<{ ok: boolean; error?: string }>;
   cancelSupplyRequest: (id: string) => Promise<{ ok: boolean; error?: string }>;
   searchReceivingHistory: (from?: string, to?: string) => Promise<{ ok: true; rows: SupplyReceipt[] } | { ok: false; error: string }>;
-}
-
-/* For each distinct product+unit, the declared total received
-   quantity is the sum of its condition rows (GOOD + DAMAGED). */
-function withItemTotals(rec: SupplyReceipt): SupplyReceipt {
-  const totals = new Map<string, number>();
-  for (const i of rec.items) {
-    const key = `${i.productName}::${i.unit}`;
-    totals.set(key, (totals.get(key) ?? 0) + Number(i.qty));
-  }
-  return {
-    ...rec,
-    items: rec.items.map(i => ({
-      ...i,
-      qty: Number(i.qty),
-      totalQty: totals.get(`${i.productName}::${i.unit}`),
-    })),
-  };
+  listArrivalDocuments: (arrivalId: string) => Promise<SupplyDeliveryDocument[]>;
+  fetchArrivalFile: (arrivalId: string, docId: number) => Promise<Blob>;
 }
 
 export function useVendorData(): {
@@ -370,12 +507,15 @@ export function useVendorData(): {
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [supplyRequests, setSupplyRequests] = useState<SupplyRequest[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
+  const [replacementRequests, setReplacementRequests] = useState<ReplacementRequest[]>([]);
+  const [vendorReceivings, setVendorReceivings] = useState<VendorReceiving[]>([]);
+  const [discrepancyReports, setDiscrepancyReports] = useState<DiscrepancyReport[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sessionExpired, setSessionExpired] = useState(false);
 
-  const settersRef = useRef({ setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts });
-  settersRef.current = { setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts };
+  const settersRef = useRef({ setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts, setReplacementRequests, setVendorReceivings, setDiscrepancyReports });
+  settersRef.current = { setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts, setReplacementRequests, setVendorReceivings, setDiscrepancyReports };
 
   const refresh = useCallback(async () => {
     setSessionExpired(false);
@@ -388,6 +528,9 @@ export function useVendorData(): {
       s.setNotifications(boot.notifications);
       s.setSupplyRequests(boot.supplyRequests);
       s.setProducts(boot.products);
+      s.setReplacementRequests(boot.replacementRequests ?? []);
+      s.setVendorReceivings(boot.vendorReceivings ?? []);
+      s.setDiscrepancyReports(boot.discrepancyReports ?? []);
       setError(null);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
@@ -421,23 +564,14 @@ export function useVendorData(): {
     }
   }, [refresh]);
 
-  const recordReceipt: VendorActions["recordReceipt"] = async (rec) => {
-    const isEdit = receipts.some(r => r.id === rec.id);
-    const payload = withItemTotals(rec);
+  const confirmVendorReceiving: VendorActions["confirmVendorReceiving"] = async (arrivalId, input) => {
     try {
-      if (isEdit) await api.updateReceipt(payload);
-      else await api.createReceipt(payload);
+      await api.confirmVendorReceiving(arrivalId, input);
       await refresh();
       return { ok: true };
     } catch (e) {
-      if (e instanceof ApiError) return { ok: false, error: e.message, errors: e.errors };
-      return { ok: false, error: "Failed to save the receiving record." };
+      return requestResult(e, "Failed to confirm Vendor receiving.");
     }
-  };
-
-  const updateArrivalStatus: VendorActions["updateArrivalStatus"] = (id, status) => {
-    setArrivals(prev => prev.map(a => a.id === id ? { ...a, status } : a));
-    void sync(() => api.updateArrivalStatus(id, status));
   };
 
   const toggleSupplierActive: VendorActions["toggleSupplierActive"] = (id) => {
@@ -498,21 +632,28 @@ export function useVendorData(): {
     }
   };
 
+  const listArrivalDocuments: VendorActions["listArrivalDocuments"] = (arrivalId) =>
+    api.listArrivalDocuments(arrivalId);
+
+  const fetchArrivalFile: VendorActions["fetchArrivalFile"] = (arrivalId, docId) =>
+    api.fetchArrivalFile(arrivalId, docId);
+
   return {
-    data: { suppliers, arrivals, receipts, notifications, supplyRequests, products },
+    data: { suppliers, arrivals, receipts, notifications, supplyRequests, products, replacementRequests, vendorReceivings, discrepancyReports },
     loading,
     error,
     sessionExpired,
     refresh,
     actions: {
-      recordReceipt,
-      updateArrivalStatus,
+      confirmVendorReceiving,
       toggleSupplierActive,
       createSupplyRequest,
       updateSupplyRequest,
       submitSupplyRequest,
       cancelSupplyRequest,
       searchReceivingHistory,
+      listArrivalDocuments,
+      fetchArrivalFile,
       markNotifRead: (id) => {
         setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
         void sync(() => api.markNotifRead(id));

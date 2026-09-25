@@ -1,10 +1,9 @@
 export const SUPPLY_STATUSES = [
   "expected",
-  "for_receiving",
-  "received",
+  "pending",
   "partially_received",
   "completed",
-  "rejected_damaged",
+  "reopened",
 ];
 
 export const CONDITIONS = ["good", "damaged", "rejected"];
@@ -92,11 +91,37 @@ export const REQUEST_STATUS_LABEL = {
 
 export const SUPPLY_STATUS_LABEL = {
   expected: "Expected",
-  for_receiving: "For Receiving",
-  received: "Received",
+  pending: "Pending",
   partially_received: "Partially Received",
   completed: "Completed",
-  rejected_damaged: "Rejected / Damaged",
+  reopened: "Reopened / For Correction",
+};
+
+/* Replacement requests are a separate workflow from receiving status.
+   Requested is created by the Vendor; APPROVED → FOR_DELIVERY → DELIVERED are
+   moved by the Supply Chain subsystem; RECEIVED/COMPLETED reflect replacement
+   units physically received by the Vendor against the request. */
+export const REPLACEMENT_STATUSES = [
+  "requested",
+  "approved",
+  "for_delivery",
+  "delivered",
+  "received",
+  "completed",
+  "cancelled",
+];
+
+/* Replacement requests that still owe units and may be received against. */
+export const REPLACEMENT_OPEN = ["requested", "approved", "for_delivery", "delivered", "received"];
+
+export const REPLACEMENT_STATUS_LABEL = {
+  requested: "Requested",
+  approved: "Approved",
+  for_delivery: "For Delivery",
+  delivered: "Delivered",
+  received: "Received",
+  completed: "Completed",
+  cancelled: "Cancelled",
 };
 
 /* Public supplier-sourcing workflow statuses. Applications start at

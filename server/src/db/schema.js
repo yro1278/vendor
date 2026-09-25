@@ -143,11 +143,15 @@ const TABLES = [
     receiving_by VARCHAR(120) NOT NULL DEFAULT '',
     doc_ref VARCHAR(120) NOT NULL DEFAULT '',
     remarks VARCHAR(500) NOT NULL DEFAULT '',
+    kind VARCHAR(20) NOT NULL DEFAULT 'original',
+    replacement_request_id VARCHAR(40) NULL,
     vendor_id VARCHAR(40) NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_receipts_arrival (arrival_id),
     INDEX idx_receipts_supplier (supplier_id),
     INDEX idx_receipts_status (status),
+    INDEX idx_receipts_kind (kind),
+    INDEX idx_receipts_replacement (replacement_request_id),
     INDEX idx_receipts_vendor (vendor_id),
     CONSTRAINT fk_receipt_arrival FOREIGN KEY (arrival_id) REFERENCES arrivals (id) ON DELETE SET NULL,
     CONSTRAINT fk_receipt_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers (id),
@@ -162,10 +166,136 @@ const TABLES = [
     total_received_quantity DECIMAL(12,3) NULL,
     unit VARCHAR(20) NOT NULL,
     condition_value VARCHAR(20) NOT NULL DEFAULT 'good',
+    return_to_sc TINYINT(1) NOT NULL DEFAULT 0,
     INDEX idx_ri_receipt_product (receipt_id, product_name, unit),
     CONSTRAINT fk_ri_receipt FOREIGN KEY (receipt_id) REFERENCES receipts (id) ON DELETE CASCADE,
     CONSTRAINT chk_ri_qty CHECK (qty > 0),
     CONSTRAINT chk_ri_total CHECK (total_received_quantity IS NULL OR total_received_quantity >= 0)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  /* Replacement requests: the Vendor asks Supply Chain to re-supply products
+     that arrived damaged or short. The quantity is ALWAYS derived by the system
+     — the vendor never types a replacement amount. Damaged/rejected units are
+     never accepted stock and are never requested as "extra" beyond the expected
+     delivery. Status is separate from the receiving status. */
+  `CREATE TABLE IF NOT EXISTS replacement_requests (
+    id VARCHAR(40) NOT NULL PRIMARY KEY,
+    arrival_id VARCHAR(40) NOT NULL,
+    product_name VARCHAR(180) NOT NULL,
+    unit VARCHAR(20) NOT NULL,
+    expected_qty DECIMAL(12,3) NOT NULL,
+    accepted_qty DECIMAL(12,3) NOT NULL,
+    damaged_qty DECIMAL(12,3) NOT NULL,
+    replacement_qty DECIMAL(12,3) NOT NULL,
+    reason VARCHAR(500) NOT NULL DEFAULT '',
+    remarks VARCHAR(500) NOT NULL DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT 'requested',
+    requested_by VARCHAR(120) NOT NULL DEFAULT '',
+    requested_at DATETIME NOT NULL,
+    vendor_id VARCHAR(40) NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_rpl_arrival (arrival_id),
+    INDEX idx_rpl_status (status),
+    INDEX idx_rpl_vendor (vendor_id),
+    CONSTRAINT fk_rpl_arrival FOREIGN KEY (arrival_id) REFERENCES arrivals (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  /* Correction history for reopened receiving records. A row is written on
+     every saved correction: the reason for reopening, who/when reopened,
+     who/when saved, and the exact before/after values so quantity changes
+     can be audited and no stock movement is ever double-counted. */
+  `CREATE TABLE IF NOT EXISTS receipt_corrections (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    receipt_id VARCHAR(40) NOT NULL,
+    arrival_id VARCHAR(40) NULL,
+    reopen_reason VARCHAR(500) NOT NULL DEFAULT '',
+    reopen_remarks VARCHAR(500) NOT NULL DEFAULT '',
+    reopened_by VARCHAR(120) NOT NULL DEFAULT '',
+    reopened_at DATETIME NULL,
+    saved_by VARCHAR(120) NOT NULL DEFAULT '',
+    saved_at DATETIME NOT NULL,
+    old_total_qty DECIMAL(12,3) NOT NULL,
+    new_total_qty DECIMAL(12,3) NOT NULL,
+    old_good_qty DECIMAL(12,3) NOT NULL,
+    new_good_qty DECIMAL(12,3) NOT NULL,
+    old_damaged_qty DECIMAL(12,3) NOT NULL,
+    new_damaged_qty DECIMAL(12,3) NOT NULL,
+    good_adjustment DECIMAL(12,3) NOT NULL,
+    old_items JSON NULL,
+    new_items JSON NULL,
+    INDEX idx_rc_receipt (receipt_id),
+    INDEX idx_rc_arrival (arrival_id),
+    CONSTRAINT fk_rc_receipt FOREIGN KEY (receipt_id) REFERENCES receipts (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS delivery_documents (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    arrival_id VARCHAR(40) NOT NULL,
+    original_name VARCHAR(255) NOT NULL,
+    stored_name VARCHAR(255) NOT NULL,
+    mime_type VARCHAR(120) NOT NULL,
+    size_bytes INT NOT NULL,
+    uploaded_by INT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_dd_arrival (arrival_id),
+    CONSTRAINT fk_dd_arrival FOREIGN KEY (arrival_id) REFERENCES arrivals (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  /* Vendor Receiving acknowledgments. The CHECKER result (who inspected and
+     accepted) lives in receipts/receipt_items — only good units are accepted
+     stock. This table records the Vendor acknowledging the ACCEPTED stock,
+     possibly in multiple partial transactions:
+       arrival status  = PENDING          → accepted stock ready, vendor received 0
+                         PARTIALLY_RECEIVED → 0 < vendor received < accepted
+                         COMPLETED          → vendor received all accepted stock
+     Acknowledged units never touch stock again — stock was already recorded by
+     the checker. Every row is a distinct, idempotent confirmation. */
+  `CREATE TABLE IF NOT EXISTS vendor_receivings (
+    id VARCHAR(40) NOT NULL PRIMARY KEY,
+    arrival_id VARCHAR(40) NOT NULL,
+    received_by VARCHAR(120) NOT NULL DEFAULT '',
+    received_at DATETIME NOT NULL,
+    remarks VARCHAR(500) NOT NULL DEFAULT '',
+    vendor_id VARCHAR(40) NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_vr_arrival (arrival_id),
+    INDEX idx_vr_vendor (vendor_id),
+    CONSTRAINT fk_vr_arrival FOREIGN KEY (arrival_id) REFERENCES arrivals (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS vendor_receiving_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    receiving_id VARCHAR(40) NOT NULL,
+    arrival_id VARCHAR(40) NOT NULL,
+    product_name VARCHAR(180) NOT NULL,
+    unit VARCHAR(20) NOT NULL,
+    received_qty DECIMAL(12,3) NOT NULL,
+    INDEX idx_vri_receiving (receiving_id),
+    INDEX idx_vri_arrival_product (arrival_id, product_name, unit),
+    CONSTRAINT fk_vri_receiving FOREIGN KEY (receiving_id) REFERENCES vendor_receivings (id) ON DELETE CASCADE,
+    CONSTRAINT chk_vri_qty CHECK (received_qty > 0)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  /* Discrepancy reports raised by the Vendor against a delivery. The Vendor can
+     never modify the Checker's accepted/damaged quantities — a mismatch is
+     routed here as a traceable record for the responsible subsystem instead of
+     a vendor-side reopen. */
+  `CREATE TABLE IF NOT EXISTS discrepancy_reports (
+    id VARCHAR(40) NOT NULL PRIMARY KEY,
+    arrival_id VARCHAR(40) NOT NULL,
+    receipt_id VARCHAR(40) NULL,
+    discrepancy_type VARCHAR(40) NOT NULL,
+    description VARCHAR(1000) NOT NULL,
+    requested_correction VARCHAR(1000) NOT NULL DEFAULT '',
+    reported_by VARCHAR(120) NOT NULL DEFAULT '',
+    reported_at DATETIME NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'submitted',
+    vendor_id VARCHAR(40) NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_dr_arrival (arrival_id),
+    INDEX idx_dr_vendor (vendor_id),
+    CONSTRAINT fk_dr_arrival FOREIGN KEY (arrival_id) REFERENCES arrivals (id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
   `CREATE TABLE IF NOT EXISTS notifications (
