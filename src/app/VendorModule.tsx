@@ -10,7 +10,7 @@ import {
 import {
   Supplier, SupplyReceipt, SupplyArrival, SupplyItem, ReceiptItem, ReceiptCondition, SupplyStatus, AppNotification,
   UNIT_OPTIONS, SUPPLY_STATUS_CFG, CONDITION_LABEL, supplyStatusCfg,
-  genId, fmtDate, fmtDateTime, arrivalAcceptedGood, arrivalHasIssue, receiptHasIssue, arrivalVendorReceivedQty,
+  genId, fmtDate, fmtDateTime, arrivalAcceptedGood, arrivalHasIssue, arrivalVendorReceivedQty,
   supplierReceivedQty, VendorData, VendorActions,
   RequestPriority, SupplyRequest, SupplyRequestStatus, SupplyRequestInput, SupplyDeliveryDocument,
   REQUEST_PRIORITIES, REQUEST_PRIORITY_LABEL, REQUEST_STATUS_CFG,
@@ -29,7 +29,7 @@ import { usePagePersistence, useDraftPersistence, saveDraft, clearDraft } from "
 type Page = "dashboard" | "receiving" | "monitor" | "request" | "suppliers" | "history";
 
 type ReceivingPreset = { arrivalStatus: "expected" | "pending" | "partially_received" };
-type HistoryPreset = { arrivalStatus?: SupplyStatus; issuesOnly?: boolean; from?: string; to?: string };
+type HistoryPreset = { arrivalStatus?: SupplyStatus; from?: string; to?: string };
 
 const RECEIVE_PRESET_LABEL: Record<ReceivingPreset["arrivalStatus"], string> = {
   expected: "Expected Deliveries",
@@ -87,10 +87,12 @@ const ConditionPill = ({ condition }: { condition: ReceiptCondition }) => {
   return <span className={`inline-flex items-center px-2 py-0.5 text-xs font-semibold rounded-full border ${m[condition]}`}>{CONDITION_LABEL[condition]}</span>;
 };
 
-const ReceiptStatusPill = ({ rec }: { rec: SupplyReceipt }) =>
-  receiptHasIssue(rec)
-    ? <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold rounded-full border bg-red-50 text-red-700 border-red-200"><AlertTriangle size={12} /> Rejected / Damaged</span>
-    : <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold rounded-full border bg-green-50 text-green-700 border-green-200"><CheckCircle2 size={12} /> Received</span>;
+/* The Vendor module's only receiving function is the final acknowledgment of
+   checker-accepted stock, so every record here is simply "Received". There is
+   no vendor-side condition state — damaged/rejected belong to the Checker. */
+const ReceiptStatusPill = () => (
+  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold rounded-full border bg-green-50 text-green-700 border-green-200"><CheckCircle2 size={12} /> Received</span>
+);
 
 const RequestStatusBadge = ({ status }: { status: SupplyRequestStatus }) => {
   const c = REQUEST_STATUS_CFG[status];
@@ -181,7 +183,7 @@ const ReceiptDetailsModal = ({ rec, onClose }: { rec: SupplyReceipt | null; onCl
     )}>
     {rec && (
       <div className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-2"><MonoId id={rec.id} /><ReceiptStatusPill rec={rec} /></div>
+        <div className="flex flex-wrap items-center justify-between gap-2"><MonoId id={rec.id} /><ReceiptStatusPill /></div>
         {[
           { k: "Supplier", v: `${rec.supplierName}`, i: <Building2 size={14} /> },
           { k: "Expected Supply", v: rec.arrivalId || "Ad-hoc receiving (no linked schedule)", i: <PackageOpen size={14} /> },
@@ -755,7 +757,7 @@ const Dashboard = ({ role, data, goTo, actions, onOpenReceiving, onOpenHistory }
                   <p className="text-sm font-semibold text-slate-700 flex items-center gap-2 truncate"><MonoId id={r.id} /><span className="truncate">{r.supplierName}</span></p>
                   <p className="text-xs text-slate-400 truncate">{r.items.map(i => `${i.productName} (${i.qty} ${i.unit})`).join(", ")}</p>
                 </div>
-                <div className="flex flex-col items-end gap-1 shrink-0"><ReceiptStatusPill rec={r} /><span className="text-[11px] text-slate-400 flex items-center gap-1">{fmtDateTime(r.receivedAt)}<Eye size={11} className="text-slate-300 group-hover:text-violet-500 transition-colors" /></span></div>
+                <div className="flex flex-col items-end gap-1 shrink-0"><ReceiptStatusPill /><span className="text-[11px] text-slate-400 flex items-center gap-1">{fmtDateTime(r.receivedAt)}<Eye size={11} className="text-slate-300 group-hover:text-violet-500 transition-colors" /></span></div>
               </button>
             ))}
             {recentReceipts.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No receiving transactions yet.</p>}
@@ -1025,9 +1027,9 @@ const RequestForm = ({ open, onClose, editing, data, actions }: {
                 <div className="relative">
                   <select className={selectCls} value={it.productId} onChange={e => setDraft(d => ({ ...d, items: d.items.map((x, j) => j === idx ? { ...x, productId: e.target.value ? Number(e.target.value) : "" } : x) }))}>
                     <option value="">— Select product —</option>
-                    {data.products.map(p => (
-                      <option key={p.id} value={p.id}>{p.name}{p.brand ? ` · ${p.brand}` : ""}</option>
-                    ))}
+                     {data.products.map(p => (
+                       <option key={p.id} value={p.id}>{p.name}{p.brand ? ` · ${p.brand}` : ""} ({p.sku}{p.stock ? ` · Stock: ${p.stock}` : ""})</option>
+                     ))}
                   </select>
                   <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
                 </div>
@@ -1210,8 +1212,13 @@ const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: Ven
     return matchF && matchQ;
   }).sort((a, b) => +new Date(b.requestDate) - +new Date(a.requestDate));
 
-  const filterCount = (key: RequestFilterKey) =>
-    key === "all" ? data.supplyRequests.length : data.supplyRequests.filter(r => REQUEST_FILTER_GROUPS[key].includes(r.status)).length;
+  const filterCount = (key: RequestFilterKey) => {
+    const counts = data.supplyRequestCounts ?? {};
+    if (key === "all") {
+      return Object.values(counts).reduce((a, b) => a + b, 0);
+    }
+    return REQUEST_FILTER_GROUPS[key].reduce((a, s) => a + (counts[s] ?? 0), 0);
+  };
 
   const moreActive = filter === "rejected" || filter === "cancelled";
 
@@ -1930,7 +1937,7 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
                     <td className="px-4 py-3"><p className="text-sm font-semibold text-slate-800">{s.companyName}</p><MonoId id={s.id} /></td>
                     <td className="px-4 py-3"><MonoId id={s.sourceRef} /></td>
                     <td className="px-4 py-3"><p className="text-sm text-slate-700">{s.contactName}</p><p className="text-xs text-slate-400">{s.supplierType}</p></td>
-                    <td className="px-4 py-3 text-xs text-slate-600 max-w-[240px]"><p className="truncate">{s.products.map(p => p.name).join(", ") || "—"}</p><p className="text-[11px] text-slate-400 mt-0.5">{[...new Set(s.products.filter(p => p.category).map(p => p.category))].join(", ")}</p></td>
+                    <td className="px-4 py-3 text-xs text-slate-600 max-w-[240px]"><p className="truncate">{s.products.map(p => `${p.name} (${p.sku})`).join(", ") || "—"}</p><p className="text-[11px] text-slate-400 mt-0.5">{[...new Set(s.products.filter(p => p.category).map(p => p.category))].join(", ")}</p></td>
                     <td className="px-4 py-3 text-xs text-slate-600">{fmtDate(s.establishedOn)}</td>
                     <td className="px-4 py-3"><SupStatusPill status={s.status} /></td>
                     <td className="px-4 py-3"><div className="flex justify-end"><Btn size="sm" variant="secondary" onClick={() => setViewing({ ...s })}><Eye size={12} /> View</Btn></div></td>
@@ -1953,7 +1960,7 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
             <div className="space-y-1 text-xs text-slate-600 mb-3">
               <div className="flex gap-2"><Users size={12} className="text-slate-400 mt-0.5" />{s.contactName} · {s.supplierType}</div>
               <div className="flex gap-2"><Mail size={12} className="text-slate-400 mt-0.5" />{s.contactEmail}</div>
-              <div className="flex gap-2"><PackageOpen size={12} className="text-slate-400 mt-0.5" />{s.products.map(p => p.name).join(", ") || "—"}</div>
+              <div className="flex gap-2"><PackageOpen size={12} className="text-slate-400 mt-0.5" />{s.products.map(p => `${p.name}${p.sku ? ` (${p.sku})` : ""}`).join(", ") || "—"}</div>
               <div className="flex gap-2"><Info size={12} className="text-slate-400 mt-0.5" />Source Ref <MonoId id={s.sourceRef} /></div>
             </div>
             <Btn size="sm" variant="secondary" className="w-full" onClick={() => setViewing({ ...s })}><Eye size={12} /> View Supplier</Btn>
@@ -1990,14 +1997,15 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
               <p className="text-sm font-bold text-slate-700 mb-2">Products / Supplies Provided</p>
               <div className="space-y-2">
                 {viewing.products.map(p => (
-                  <div key={p.id} className="border border-slate-200 rounded-xl p-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <p className="text-sm font-semibold text-slate-800">{p.name}</p>
-                      {p.category && <span className="text-[11px] bg-violet-50 text-violet-700 border border-violet-200 px-2 py-0.5 rounded-full">{p.category}</span>}
-                    </div>
-                    <p className="text-xs text-slate-500">{p.description || "—"} <span className="text-slate-400">· {p.brand}</span></p>
-                  </div>
-                ))}
+                   <div key={p.id} className="border border-slate-200 rounded-xl p-3">
+                     <div className="flex items-center justify-between mb-1">
+                       <p className="text-sm font-semibold text-slate-800">{p.name}</p>
+                       <span className="text-[11px] bg-violet-50 text-violet-700 border border-violet-200 px-2 py-0.5 rounded-full">{p.sku}{p.unit ? ` · ${p.unit}` : ""}</span>
+                     </div>
+                     <p className="text-xs text-slate-500">{p.description || "—"} <span className="text-slate-400">· {p.brand}</span> {p.stock ? `· Stock: <strong>${p.stock}</strong>` : ""}</p>
+                     {p.category && <span className="text-[11px] bg-violet-50 text-violet-700 border border-violet-200 px-2 py-0.5 rounded-full">{p.category}</span>}
+                   </div>
+                 ))}
                 {viewing.products.length === 0 && <p className="text-xs text-slate-400">No product records provided yet.</p>}
               </div>
             </div>
@@ -2019,7 +2027,6 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
 }) => {
   const [presetLocal, setPresetLocal] = React.useState<HistoryPreset | null>(preset ?? null);
   const [q, setQ] = React.useState("");
-  const [issOnly, setIssOnly] = React.useState(!!preset?.issuesOnly);
   const [viewing, setViewing] = React.useState<SupplyReceipt | null>(null);
   const [from, setFrom] = React.useState("");
   const [to, setTo] = React.useState("");
@@ -2054,7 +2061,7 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
     setTo(t);
     setRangeLoading(true);
     void (async () => {
-      const res = await actions.searchReceivingHistory(f || undefined, t || undefined);
+      const res = await actions.searchVendorReceivingHistory(f || undefined, t || undefined);
       setRangeLoading(false);
       if (res.ok) {
         setFilteredRows(res.rows);
@@ -2075,7 +2082,7 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
     }
     setRangeError("");
     setRangeLoading(true);
-    const res = await actions.searchReceivingHistory(f || undefined, t || undefined);
+    const res = await actions.searchVendorReceivingHistory(f || undefined, t || undefined);
     setRangeLoading(false);
     if (res.ok) {
       setFilteredRows(res.rows);
@@ -2097,7 +2104,7 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
   const editFrom = (v: string) => { setFrom(v); setFilteredRows(null); setRange(null); setRangeError(""); };
   const editTo = (v: string) => { setTo(v); setFilteredRows(null); setRange(null); setRangeError(""); };
 
-  const base = (filteredRows ?? data.receipts).filter(r =>
+  const base = (filteredRows ?? data.vendorReceivingHistory).filter(r =>
     presetLocal?.arrivalStatus
       ? data.arrivals.find(a => a.id === r.arrivalId)?.status === presetLocal.arrivalStatus
       : true
@@ -2106,8 +2113,7 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
     .filter(r => {
       const qq = q.toLowerCase();
       const matchQ = !qq || r.id.toLowerCase().includes(qq) || r.supplierName.toLowerCase().includes(qq) || r.docRef.toLowerCase().includes(qq) || r.receivingBy.toLowerCase().includes(qq) || r.items.some(i => i.productName.toLowerCase().includes(qq));
-      const matchIss = !issOnly || receiptHasIssue(r);
-      return matchQ && matchIss;
+      return matchQ;
     })
     .sort((a, b) =>
       sortDir === "new"
@@ -2130,7 +2136,6 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
             <input className={`${inp} pl-9`} placeholder="Search ref no., supplier, product, received by, doc ref…" value={q} onChange={e => setQ(e.target.value)} />
           </div>
           <div className="flex gap-2 flex-wrap">
-            <button onClick={() => setIssOnly(v => !v)} className={`px-3.5 py-2 text-xs font-semibold rounded-xl border transition-colors ${issOnly ? "bg-red-50 text-red-700 border-red-200" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"}`}><AlertTriangle size={13} className="inline -mt-0.5 mr-1" /> Issues / Damaged only</button>
             <button onClick={() => setSortDir(d => d === "new" ? "old" : "new")} className={`px-3.5 py-2 text-xs font-semibold rounded-xl border transition-colors ${sortDir === "new" ? "bg-white text-slate-500 border-slate-200 hover:border-slate-300" : "bg-violet-50 text-violet-700 border-violet-200"}`}><ArrowDownUp size={13} className="inline -mt-0.5 mr-1" /> {sortDir === "new" ? "Newest First" : "Oldest First"}</button>
           </div>
         </div>
@@ -2184,7 +2189,7 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
                     <td className="px-4 py-3 text-right text-sm font-bold text-slate-800">{r.totalQty.toLocaleString()}</td>
                     <td className="px-4 py-3 text-xs text-slate-600 whitespace-nowrap">{fmtDateTime(r.receivedAt)}</td>
                     <td className="px-4 py-3 text-xs text-slate-600">{r.receivingBy}</td>
-                    <td className="px-4 py-3"><ReceiptStatusPill rec={r} /></td>
+                    <td className="px-4 py-3"><ReceiptStatusPill /></td>
                     <td className="px-4 py-3"><div className="flex justify-end"><button onClick={() => setViewing({ ...r })} className="p-2 rounded-lg hover:bg-slate-50 border border-transparent hover:border-slate-200 text-slate-600 hover:text-violet-700" title="View details"><Eye size={14} /></button></div></td>
                   </tr>
                 ))}
@@ -2199,7 +2204,7 @@ const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
             <Card key={r.id} className="p-4">
               <div className="flex items-start justify-between gap-2 mb-2">
                 <div className="min-w-0"><MonoId id={r.id} /><p className="text-sm font-bold text-slate-800 mt-1 truncate">{r.supplierName}</p></div>
-                <ReceiptStatusPill rec={r} />
+                <ReceiptStatusPill />
               </div>
               <div className="space-y-1 text-xs text-slate-600 mb-3">
                 <div className="flex gap-2"><PackageOpen size={12} className="text-slate-400 mt-0.5" />{r.items.map(i => `${i.productName} (${i.qty} ${i.unit})`).join(", ")}</div>

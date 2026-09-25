@@ -19,7 +19,7 @@ import { api, ApiError, clearToken } from "./api";
    ───────────────────────────────────────────────────────── */
 
 export type SupplierType = "Manufacturer" | "Distributor" | "Wholesaler" | "Importer" | "Other";
-export type ProductCategory = "Dry Products" | "Frozen Products" | "Cosmetic Products" | "Packaging" | "General Merchandise";
+export type ProductCategory = "Oral Care" | "Hair Care & Skin Care" | "Household & Laundry" | "Dry Products" | "Frozen Products" | "Cosmetic Products" | "Packaging" | "General Merchandise";
 
 export type SupplyStatus =
   | "expected"
@@ -28,44 +28,6 @@ export type SupplyStatus =
   | "completed";
 
 export type ReceiptCondition = "good" | "damaged" | "rejected";
-
-/* Status of a replacement request — a SEPARATE workflow from receiving.
-   Requested is opened by the Vendor; APPROVED → FOR DELIVERY → DELIVERED are
-   moved by the Supply Chain subsystem; RECEIVED / COMPLETED reflect units the
-   Vendor physically received against the request; CANCELLED means voided. */
-export type ReplacementStatus =
-  | "requested"
-  | "approved"
-  | "for_delivery"
-  | "delivered"
-  | "received"
-  | "completed"
-  | "cancelled";
-
-/* Replacement request for a product whose original receipt fell short of the
-   expected quantity (damaged / rejected / short shipment). The quantity is
-   always derived by the system: Replacement Required = Expected − Accepted. */
-export interface ReplacementRequest {
-  id: string;
-  arrivalId: string;
-  arrivalRef: string;             /* SC-SCHED-… source reference for the delivery */
-  supplierId: string;
-  supplierName: string;
-  productName: string;
-  unit: string;
-  expectedQty: number;
-  acceptedQty: number;            /* GOOD units accepted on the original receipt */
-  damagedQty: number;             /* damaged + rejected units on the original receipt */
-  replacementQty: number;         /* derived: max(0, expected − accepted) */
-  receivedQty: number;            /* good units received against this request */
-  remainingQty: number;           /* replacementQty − receivedQty */
-  reason: string;
-  remarks: string;
-  status: ReplacementStatus;
-  requestedBy: string;
-  requestedAt: string;
-  createdAt: string;
-}
 
 /* A Vendor Receiving acknowledgment. Records receipt of ACCEPTED stock (the
    Checker/Inspection result). Partial acknowledgments stack until every
@@ -88,28 +50,15 @@ export interface VendorReceiving {
   items: VendorReceivingItem[];
 }
 
-/* A discrepancy report filed against an inspection/delivery. The Vendor can
-   never modify the Checker's quantities — disputes ride this traceable channel. */
-export interface DiscrepancyReport {
-  id: string;
-  arrivalId: string;
-  arrivalRef: string;
-  supplierName: string;
-  receiptId: string | null;
-  discrepancyType: string;
-  description: string;
-  requestedCorrection: string;
-  status: string;
-  reportedBy: string;
-  reportedAt: string;
-}
-
 export interface Product {
   id: string;
   name: string;
   description: string;
   brand: string;
   category: ProductCategory | "";
+  sku: string;
+  stock: number;
+  unit: string;
 }
 
 /* Supplier record as provided by the Supply Chain subsystem.
@@ -307,7 +256,7 @@ export interface SupplyRequest {
 /* ── constants ─────────────────────────────────────────── */
 
 export const SUPPLIER_TYPES: SupplierType[] = ["Manufacturer", "Distributor", "Wholesaler", "Importer", "Other"];
-export const PRODUCT_CATEGORIES: ProductCategory[] = ["Dry Products", "Frozen Products", "Cosmetic Products", "Packaging", "General Merchandise"];
+export const PRODUCT_CATEGORIES: ProductCategory[] = ["Oral Care", "Hair Care & Skin Care", "Household & Laundry", "Dry Products", "Frozen Products", "Cosmetic Products", "Packaging", "General Merchandise"];
 export const UNIT_OPTIONS = ["pcs", "box", "case", "sack", "bag", "kg", "L", "pack", "pallet"];
 
 export const SUPPLY_STATUS_CFG: Record<SupplyStatus, { label: string; cls: string; dot: string }> = {
@@ -325,16 +274,6 @@ const UNKNOWN_STATUS_CFG = { label: "Processing", cls: "bg-slate-50 text-slate-5
 
 export const supplyStatusCfg = (status: string): { label: string; cls: string; dot: string } =>
   SUPPLY_STATUS_CFG[status as SupplyStatus] ?? UNKNOWN_STATUS_CFG;
-
-export const REPLACEMENT_STATUS_CFG: Record<ReplacementStatus, { label: string; cls: string; dot: string }> = {
-  requested:   { label: "Requested",   cls: "bg-sky-50 text-sky-700 border-sky-200",       dot: "bg-sky-500" },
-  approved:    { label: "Approved",    cls: "bg-violet-50 text-violet-700 border-violet-200", dot: "bg-violet-500" },
-  for_delivery: { label: "For Delivery", cls: "bg-indigo-50 text-indigo-700 border-indigo-200", dot: "bg-indigo-500" },
-  delivered:   { label: "Delivered",   cls: "bg-cyan-50 text-cyan-700 border-cyan-200",     dot: "bg-cyan-500" },
-  received:    { label: "Received",    cls: "bg-amber-50 text-amber-700 border-amber-200",  dot: "bg-amber-500" },
-  completed:   { label: "Completed",   cls: "bg-green-50 text-green-700 border-green-200",   dot: "bg-green-500" },
-  cancelled:   { label: "Cancelled",   cls: "bg-slate-50 text-slate-500 border-slate-200",   dot: "bg-slate-400" },
-};
 
 export const CONDITION_LABEL: Record<ReceiptCondition, string> = {
   good: "Good",
@@ -469,9 +408,9 @@ export interface VendorData {
   notifications: AppNotification[];
   supplyRequests: SupplyRequest[];
   products: Product[];        /* product master (existing supplier_products records) */
-  replacementRequests: ReplacementRequest[];
   vendorReceivings: VendorReceiving[];
-  discrepancyReports: DiscrepancyReport[];
+  supplyRequestCounts: Record<string, number>;
+  vendorReceivingHistory: SupplyReceipt[];
 }
 
 export interface VendorActions {
@@ -489,6 +428,8 @@ export interface VendorActions {
   submitSupplyRequest: (id: string) => Promise<{ ok: boolean; error?: string }>;
   cancelSupplyRequest: (id: string) => Promise<{ ok: boolean; error?: string }>;
   searchReceivingHistory: (from?: string, to?: string) => Promise<{ ok: true; rows: SupplyReceipt[] } | { ok: false; error: string }>;
+  searchVendorReceivingHistory: (from?: string, to?: string) => Promise<{ ok: true; rows: SupplyReceipt[] } | { ok: false; error: string }>;
+  fetchSupplyRequestCounts: () => Promise<{ ok: true; counts: Record<string, number> } | { ok: false; error: string }>;
   listArrivalDocuments: (arrivalId: string) => Promise<SupplyDeliveryDocument[]>;
   fetchArrivalFile: (arrivalId: string, docId: number) => Promise<Blob>;
 }
@@ -507,20 +448,22 @@ export function useVendorData(): {
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [supplyRequests, setSupplyRequests] = useState<SupplyRequest[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
-  const [replacementRequests, setReplacementRequests] = useState<ReplacementRequest[]>([]);
   const [vendorReceivings, setVendorReceivings] = useState<VendorReceiving[]>([]);
-  const [discrepancyReports, setDiscrepancyReports] = useState<DiscrepancyReport[]>([]);
+  const [supplyRequestCounts, setSupplyRequestCounts] = useState<Record<string, number>>({});
+  const [vendorReceivingHistory, setVendorReceivingHistory] = useState<SupplyReceipt[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sessionExpired, setSessionExpired] = useState(false);
 
-  const settersRef = useRef({ setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts, setReplacementRequests, setVendorReceivings, setDiscrepancyReports });
-  settersRef.current = { setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts, setReplacementRequests, setVendorReceivings, setDiscrepancyReports };
+  const settersRef = useRef({ setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts, setVendorReceivings, setSupplyRequestCounts, setVendorReceivingHistory });
+  settersRef.current = { setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts, setVendorReceivings, setSupplyRequestCounts, setVendorReceivingHistory };
 
   const refresh = useCallback(async () => {
     setSessionExpired(false);
     try {
       const boot = await api.bootstrap();
+      const counts = await api.supplyRequestCounts();
+      const vrh = await api.receivingVendorHistory();
       const s = settersRef.current;
       s.setSuppliers(boot.suppliers);
       s.setArrivals(boot.arrivals);
@@ -528,9 +471,9 @@ export function useVendorData(): {
       s.setNotifications(boot.notifications);
       s.setSupplyRequests(boot.supplyRequests);
       s.setProducts(boot.products);
-      s.setReplacementRequests(boot.replacementRequests ?? []);
       s.setVendorReceivings(boot.vendorReceivings ?? []);
-      s.setDiscrepancyReports(boot.discrepancyReports ?? []);
+      s.setSupplyRequestCounts(counts);
+      s.setVendorReceivingHistory(vrh);
       setError(null);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
@@ -632,6 +575,23 @@ export function useVendorData(): {
     }
   };
 
+  const searchVendorReceivingHistory: VendorActions["searchVendorReceivingHistory"] = async (from, to) => {
+    try {
+      return { ok: true, rows: await api.receivingVendorHistory({ from, to }) };
+    } catch (e) {
+      return { ok: false, error: requestResult(e, "Failed to filter vendor receiving history.").error };
+    }
+  };
+
+  const fetchSupplyRequestCounts: VendorActions["fetchSupplyRequestCounts"] = async () => {
+    try {
+      const counts = await api.supplyRequestCounts();
+      return { ok: true, counts };
+    } catch (e) {
+      return { ok: false, error: requestResult(e, "Failed to load supply request counts.").error };
+    }
+  };
+
   const listArrivalDocuments: VendorActions["listArrivalDocuments"] = (arrivalId) =>
     api.listArrivalDocuments(arrivalId);
 
@@ -639,7 +599,7 @@ export function useVendorData(): {
     api.fetchArrivalFile(arrivalId, docId);
 
   return {
-    data: { suppliers, arrivals, receipts, notifications, supplyRequests, products, replacementRequests, vendorReceivings, discrepancyReports },
+    data: { suppliers, arrivals, receipts, notifications, supplyRequests, products, vendorReceivings, supplyRequestCounts, vendorReceivingHistory },
     loading,
     error,
     sessionExpired,
@@ -652,6 +612,8 @@ export function useVendorData(): {
       submitSupplyRequest,
       cancelSupplyRequest,
       searchReceivingHistory,
+      searchVendorReceivingHistory,
+      fetchSupplyRequestCounts,
       listArrivalDocuments,
       fetchArrivalFile,
       markNotifRead: (id) => {

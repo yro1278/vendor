@@ -1,7 +1,5 @@
 import type {
   AppNotification,
-  DiscrepancyReport,
-  ReplacementRequest,
   SupplyArrival,
   SupplyDeliveryDocument,
   SupplyReceipt,
@@ -25,9 +23,7 @@ export interface BootstrapData {
   notifications: AppNotification[];
   supplyRequests: SupplyRequest[];
   products: Product[];
-  replacementRequests: ReplacementRequest[];
   vendorReceivings: VendorReceiving[];
-  discrepancyReports: DiscrepancyReport[];
 }
 
 export interface LoginResult {
@@ -225,15 +221,26 @@ export const api = {
       method: "POST",
     }),
 
-  receivingHistory: (params: { from?: string; to?: string } = {}) => {
-    const q = new URLSearchParams();
-    if (params.from) q.set("from", params.from);
-    if (params.to) q.set("to", params.to);
-    const qs = q.toString();
-    return request<SupplyReceipt[]>(`/vendor/receiving/history${qs ? `?${qs}` : ""}`);
-  },
+receivingHistory: (params: { from?: string; to?: string } = {}) => {
+     const q = new URLSearchParams();
+     if (params.from) q.set("from", params.from);
+     if (params.to) q.set("to", params.to);
+     const qs = q.toString();
+     return request<SupplyReceipt[]>(`/vendor/receiving/history${qs ? `?${qs}` : ""}`);
+   },
 
-  verifyReceivingReportPassword: (password: string) =>
+   receivingVendorHistory: (params: { from?: string; to?: string } = {}) => {
+     const q = new URLSearchParams();
+     if (params.from) q.set("from", params.from);
+     if (params.to) q.set("to", params.to);
+     const qs = q.toString();
+     return request<SupplyReceipt[]>(`/vendor/receiving/vendor-history${qs ? `?${qs}` : ""}`);
+   },
+
+   supplyRequestCounts: () =>
+     request<Record<string, number>>("/vendor/supply-requests/counts"),
+
+   verifyReceivingReportPassword: (password: string) =>
     request<{ ok: boolean; grant: string }>("/vendor/receiving/report/verify", {
       method: "POST",
       body: JSON.stringify({ password }),

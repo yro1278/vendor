@@ -26,40 +26,36 @@ const MIGRATIONS = [
   `ALTER TABLE receipts ADD COLUMN vendor_id VARCHAR(40) NOT NULL DEFAULT '' AFTER remarks`,
   `ALTER TABLE receipts ADD INDEX idx_receipts_vendor (vendor_id)`,
 
-  /* Reopen-for-correction support: the existing receiving record is retained
-     and updated in place; these columns preserve the reopen context and who
-     requested it. */
-  `ALTER TABLE receipts ADD COLUMN reopen_reason VARCHAR(500) NOT NULL DEFAULT '' AFTER remarks`,
-  `ALTER TABLE receipts ADD COLUMN reopen_remarks VARCHAR(500) NOT NULL DEFAULT '' AFTER reopen_reason`,
-  `ALTER TABLE receipts ADD COLUMN reopened_by VARCHAR(120) NOT NULL DEFAULT '' AFTER reopen_remarks`,
-  `ALTER TABLE receipts ADD COLUMN reopened_at DATETIME NULL AFTER reopened_by`,
-  `ALTER TABLE notifications ADD COLUMN vendor_id VARCHAR(40) NOT NULL DEFAULT '' AFTER is_read`,
-  `ALTER TABLE notifications ADD INDEX idx_notifications_vendor (vendor_id)`,
-  `ALTER TABLE notifications ADD COLUMN recipient VARCHAR(20) NOT NULL DEFAULT 'all' AFTER vendor_id`,
-  `ALTER TABLE notifications ADD INDEX idx_notifications_recipient (recipient)`,
-  `ALTER TABLE supply_requests ADD COLUMN vendor_id VARCHAR(40) NOT NULL DEFAULT '' AFTER expected_delivery_date`,
-  `ALTER TABLE supply_requests ADD INDEX idx_req_vendor (vendor_id)`,
-  `ALTER TABLE suppliers ADD COLUMN evaluation_score DECIMAL(5,2) NULL AFTER status`,
-  `ALTER TABLE suppliers ADD COLUMN performance_rating DECIMAL(5,2) NULL AFTER evaluation_score`,
-  `ALTER TABLE suppliers ADD COLUMN last_evaluated DATETIME NULL AFTER performance_rating`,
-  `ALTER TABLE suppliers ADD COLUMN source_application_id VARCHAR(40) NULL AFTER source_ref`,
-  `UPDATE users SET role = 'receiving_staff' WHERE role = 'vendor'`,
+   /* Reopen-for-correction support: the existing receiving record is retained
+      and updated in place; these columns preserve the reopen context and who
+      requested it. */
+   `ALTER TABLE receipts ADD COLUMN reopen_reason VARCHAR(500) NOT NULL DEFAULT '' AFTER remarks`,
+   `ALTER TABLE receipts ADD COLUMN reopen_remarks VARCHAR(500) NOT NULL DEFAULT '' AFTER reopen_reason`,
+   `ALTER TABLE receipts ADD COLUMN reopened_by VARCHAR(120) NOT NULL DEFAULT '' AFTER reopen_remarks`,
+   `ALTER TABLE receipts ADD COLUMN reopened_at DATETIME NULL AFTER reopened_by`,
+   `ALTER TABLE notifications ADD COLUMN vendor_id VARCHAR(40) NOT NULL DEFAULT '' AFTER is_read`,
+   `ALTER TABLE notifications ADD INDEX idx_notifications_vendor (vendor_id)`,
+   `ALTER TABLE notifications ADD COLUMN recipient VARCHAR(20) NOT NULL DEFAULT 'all' AFTER vendor_id`,
+   `ALTER TABLE notifications ADD INDEX idx_notifications_recipient (recipient)`,
+   `ALTER TABLE supply_requests ADD COLUMN vendor_id VARCHAR(40) NOT NULL DEFAULT '' AFTER expected_delivery_date`,
+   `ALTER TABLE supply_requests ADD INDEX idx_req_vendor (vendor_id)`,
+   `ALTER TABLE suppliers ADD COLUMN evaluation_score DECIMAL(5,2) NULL AFTER status`,
+   `ALTER TABLE suppliers ADD COLUMN performance_rating DECIMAL(5,2) NULL AFTER evaluation_score`,
+   `ALTER TABLE suppliers ADD COLUMN last_evaluated DATETIME NULL AFTER performance_rating`,
+   `ALTER TABLE suppliers ADD COLUMN source_application_id VARCHAR(40) NULL AFTER source_ref`,
+   `UPDATE users SET role = 'receiving_staff' WHERE role = 'vendor'`,
 
-  /* Partial Receiving + Replacement Request model: damaged/rejected units are
-     never a receiving status and never accepted stock. Receipts carry a kind so
-     replacement receipts never compete with original receiving over the ceiling. */
-  `ALTER TABLE receipt_items ADD COLUMN return_to_sc TINYINT(1) NOT NULL DEFAULT 0 AFTER condition_value`,
-  `ALTER TABLE receipts ADD COLUMN kind VARCHAR(20) NOT NULL DEFAULT 'original' AFTER remarks`,
-  `ALTER TABLE receipts ADD COLUMN replacement_request_id VARCHAR(40) NULL AFTER kind`,
-  `ALTER TABLE receipts ADD INDEX idx_receipts_kind (kind)`,
-  `ALTER TABLE receipts ADD INDEX idx_receipts_replacement (replacement_request_id)`,
+   /* Product master: add sku, stock, unit columns to supplier_products */
+   `ALTER TABLE supplier_products ADD COLUMN sku VARCHAR(60) NOT NULL DEFAULT '' AFTER category`,
+   `ALTER TABLE supplier_products ADD COLUMN stock INT NOT NULL DEFAULT 0 AFTER sku`,
+   `ALTER TABLE supplier_products ADD COLUMN unit VARCHAR(20) NOT NULL DEFAULT 'pcs' AFTER stock`,
 
-  /* Remap legacy delivery statuses into the PENDING / PARTIALLY RECEIVED /
-     COMPLETED model. 'for_receiving' and the unreachable 'received' both mean
-     "at the facility, awaiting receiving" → pending. 'rejected_damaged' is now
-     a partial receiving with an automatically-derived replacement requirement. */
-  `UPDATE arrivals SET status = 'pending' WHERE status IN ('for_receiving', 'received')`,
-  `UPDATE arrivals SET status = 'partially_received' WHERE status = 'rejected_damaged'`,
+   /* Remap legacy delivery statuses into the PENDING / PARTIALLY RECEIVED /
+      COMPLETED model. 'for_receiving' and the unreachable 'received' both mean
+      "at the facility, awaiting receiving" → pending. 'rejected_damaged' is now
+      a partial receiving with an automatically-derived replacement requirement. */
+   `UPDATE arrivals SET status = 'pending' WHERE status IN ('for_receiving', 'received')`,
+   `UPDATE arrivals SET status = 'partially_received' WHERE status = 'rejected_damaged'`,
 ];
 
 /*

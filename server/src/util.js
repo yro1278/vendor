@@ -41,6 +41,9 @@ export function mapProduct(row) {
     description: row.description,
     brand: row.brand,
     category: row.category,
+    sku: row.sku ?? "",
+    stock: Number(row.stock) ?? 0,
+    unit: row.unit ?? "pcs",
   };
 }
 
@@ -120,36 +123,6 @@ export function mapReceipt(row, items = []) {
   };
 }
 
-/* A replacement request. replacement_qty is ALWAYS derived server-side:
-   max(0, expected − accepted). accepted_qty is the GOOD units already received
-   on the original receipt; damaged_qty includes damaged + rejected units. The
-   vendor never types a replacement amount — the system computes it. */
-export function mapReplacementRequest(row, received = 0) {
-  const replacementQty = Number(row.replacement_qty);
-  const receivedQty = round3(received);
-  return {
-    id: row.id,
-    arrivalId: row.arrival_id,
-    arrivalRef: row.source_ref ?? "",
-    supplierId: row.supplier_id ?? "",
-    supplierName: row.supplier_name ?? "",
-    productName: row.product_name,
-    unit: row.unit,
-    expectedQty: Number(row.expected_qty),
-    acceptedQty: Number(row.accepted_qty),
-    damagedQty: Number(row.damaged_qty),
-    replacementQty,
-    receivedQty,
-    remainingQty: round3(Math.max(0, replacementQty - receivedQty)),
-    reason: row.reason ?? "",
-    remarks: row.remarks ?? "",
-    status: row.status,
-    requestedBy: row.requested_by ?? "",
-    requestedAt: toIso(row.requested_at),
-    createdAt: toIso(row.created_at),
-  };
-}
-
 /* A Vendor Receiving acknowledgment. Always records units of ACCEPTED stock —
    the Checker's inspection result, never a vendor-editable quantity. */
 export function mapVendorReceiving(row, items = []) {
@@ -167,23 +140,6 @@ export function mapVendorReceiving(row, items = []) {
       unit: i.unit,
       qty: Number(i.received_qty),
     })),
-  };
-}
-
-/* A discrepancy report filed by the Vendor against an inspection/delivery. */
-export function mapDiscrepancy(row) {
-  return {
-    id: row.id,
-    arrivalId: row.arrival_id,
-    arrivalRef: row.source_ref ?? "",
-    supplierName: row.supplier_name ?? "",
-    receiptId: row.receipt_id ?? null,
-    discrepancyType: row.discrepancy_type,
-    description: row.description,
-    requestedCorrection: row.requested_correction ?? "",
-    status: row.status,
-    reportedBy: row.reported_by ?? "",
-    reportedAt: toIso(row.reported_at),
   };
 }
 

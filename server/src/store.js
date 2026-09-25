@@ -5,16 +5,12 @@ import {
   COUNT_UNITS,
   DEFAULT_VENDOR_ID,
   EVALUATION_CRITERIA,
-  RECEIPT_STATUSES,
-  REPLACEMENT_OPEN,
-  REPLACEMENT_STATUSES,
   REQUEST_PRIORITIES,
   REQUEST_STATUSES,
   REQUEST_STATUS_LABEL,
   SUPPLIER_STATUSES,
   SUPPLIER_TYPES,
   SUPPLY_STATUSES,
-  SUPPLY_STATUS_LABEL,
 } from "./db/constants.js";
 import {
   genId,
@@ -27,12 +23,10 @@ import {
   mapNotification,
   mapProduct,
   mapReceipt,
-  mapReplacementRequest,
   mapRequestFulfillment,
   mapSupplier,
   mapSupplyRequest,
   mapVendorReceiving,
-  mapDiscrepancy,
   toDbDateTime,
   toIso,
 } from "./util.js";
@@ -71,106 +65,6 @@ function parseItemQty(qty, unit) {
     return { qty: null, message: "Quantity supports at most 3 decimal places." };
   }
   return { qty };
-}
-
-function validateConditionBreakdown(items) {
-  const byProduct = new Map();
-  for (const it of items) {
-    const key = `${it.productName}::${it.unit}`;
-    if (!byProduct.has(key)) byProduct.set(key, []);
-    byProduct.get(key).push(it);
-  }
-  for (const group of byProduct.values()) {
-    const total = group.reduce((a, i) => a + i.qty, 0);
-    const declared = group.filter((i) => i.declaredTotal !== null);
-    if (declared.length === 0) {
-      if (group.length > 1) {
-        return `"${group[0].productName}": add the total received quantity for this item and split the received qty across conditions (GOOD + DAMAGED must equal the total).`;
-      }
-      continue;
-    }
-    if (declared.length !== group.length) {
-      return `"${group[0].productName}": the total received quantity must be provided for every condition line of the same product/unit.`;
-    }
-    const first = declared[0].declaredTotal;
-    const consistent = declared.every((i) => Math.abs(i.declaredTotal - first) < 1e-6);
-    if (!consistent) {
-      return `"${group[0].productName}": has conflicting declared totals for the same product.`;
-    }
-    if (Math.abs(total - first) > 1e-6) {
-      return `"${group[0].productName}": condition quantities (${formatQty(total)}) must equal the total received quantity (${formatQty(first)}).`;
-    }
-  }
-  return null;
-}
-function itemGroupTotals(items) {
-  const groups = new Map();
-  for (const it of items) {
-    const key = `${it.productName}::${it.unit}`;
-    const g = groups.get(key) ?? { productName: it.productName, unit: it.unit, declared: null, received: 0 };
-    g.received = round3(g.received + it.qty);
-    if (it.declaredTotal !== null) g.declared = it.declaredTotal;
-    groups.set(key, g);
-  }
-  return [...groups.values()].map((g) => ({ ...g, totalReceived: g.declared ?? g.received }));
-}
-
-/* Sum receipt item quantities that fall within the given condition bucket. */
-function sumQtyByCondition(items, conditions) {
-  return round3(
-    items.filter((it) => conditions.includes(String(it.condition))).reduce((acc, it) => acc + Number(it.qty || 0), 0)
-  );
-}
-
-/* Enforce the core receiving rule: the TOTAL quantity received for a product
-   (Good + Damaged + Rejected) on a delivery must never exceed the quantity the
-   Supply Chain subsystem scheduled. This runs on initial receiving AND on
-   corrections (reopen) — a correction may fix the recorded details but never
-   bypass the expected-quantity ceiling.
-
-   Only ORIGINAL receiving records count toward this ceiling. Replacement units
-   received against a replacement request are good stock re-supplied by SC on
-   top of the original delivery — their own quantity is bounded by the remaining
-   replacement amount, not by this check.
-
-   `excludeReceiptId` nets out the receipt currently being corrected so its old
-   values don't count against the delivery while its corrected values are saved. */
-async function assertWithinArrivalExpected(conn, arrivalId, items, excludeReceiptId) {
-  const [arrItems] = await conn.query(
-    "SELECT product_name, unit, qty FROM arrival_items WHERE arrival_id = ?",
-    [arrivalId]
-  );
-  const params = [arrivalId];
-  let excludeClause = "";
-  if (excludeReceiptId) {
-    excludeClause = "AND r.id <> ?";
-    params.push(excludeReceiptId);
-  }
-  const [priorRows] = await conn.query(
-    `SELECT t.product_name, t.unit, COALESCE(SUM(t.per_receipt), 0) AS s
-     FROM (
-       SELECT ri.product_name, ri.unit, r.id AS rid, MAX(ri.total_received_quantity) AS per_receipt
-       FROM receipt_items ri
-       JOIN receipts r ON r.id = ri.receipt_id
-       WHERE r.arrival_id = ? AND r.kind = 'original' ${excludeClause}
-       GROUP BY ri.product_name, ri.unit, r.id
-     ) t
-     GROUP BY t.product_name, t.unit`,
-    params
-  );
-  const alreadyReceived = new Map(priorRows.map((r) => [`${r.product_name}::${r.unit}`, Number(r.s)]));
-  for (const g of itemGroupTotals(items)) {
-    const match = arrItems.find((a) => a.product_name === g.productName && a.unit === g.unit);
-    if (!match) continue;
-    const expected = Number(match.qty);
-    const totalReceived = round3((alreadyReceived.get(`${g.productName}::${g.unit}`) ?? 0) + g.received);
-    if (totalReceived > round3(expected)) {
-      throw httpError(
-        400,
-        `The receiving quantities cannot exceed the expected quantity of ${expected} ${g.unit} for "${g.productName}".`
-      );
-    }
-  }
 }
 
 async function loadSuppliers(vendorId) {
@@ -359,6 +253,110 @@ export async function fetchReceiptHistory(user, { fromDate, toDate } = {}) {
   return rows.map((r) => mapReceipt(r, byReceipt.get(r.id) ?? []));
 }
 
+/* Vendor Receiving History from vendor_receivings table.
+
+   Only COMPLETE acknowledgments belong here. A delivery whose accepted stock
+   is still being acknowledged in part (arrival status pending /
+   partially_received) stays in the Receiving work queue and must not appear in
+   the history yet — the history is the closed, fully-received ledger. The
+   completion target is the arrival's ORIGINAL required quantity, exactly as
+   syncArrivalStatus() computes it, so this filter and the arrival status can
+   never disagree.
+
+   Items carry no condition state: the Vendor acknowledges checker-ACCEPTED
+   stock only, so damaged/rejected quantities are never part of this table. */
+export async function fetchVendorReceivingHistory(user, { fromDate, toDate } = {}) {
+  const vendorId = vendorIdOf(user);
+  const where = ["vr.vendor_id = ?", "a.status = 'completed'"];
+  const params = [vendorId];
+  if (fromDate) {
+    where.push("vr.received_at >= ?");
+    params.push(`${fromDate} 00:00:00`);
+  }
+  if (toDate) {
+    where.push("vr.received_at < DATE_ADD(?, INTERVAL 1 DAY)");
+    params.push(`${toDate} 00:00:00`);
+  }
+
+  const [vrRows] = await pool.query(
+    `SELECT vr.*, a.supplier_id AS a_supplier_id, a.supplier_name AS a_supplier_name, a.source_ref AS a_source_ref
+     FROM vendor_receivings vr
+     JOIN arrivals a ON a.id = vr.arrival_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY vr.received_at DESC`,
+    params
+  );
+
+  if (vrRows.length === 0) return [];
+
+  const vrIds = vrRows.map((r) => r.id);
+  const [vriRows] = await pool.query(
+    `SELECT * FROM vendor_receiving_items WHERE receiving_id IN (${vrIds.map(() => "?").join(",")}) ORDER BY id`,
+    vrIds
+  );
+
+  /* Group vendor_receiving_items by receiving_id */
+  const byReceiving = new Map();
+  for (const it of vriRows) {
+    if (!byReceiving.has(it.receiving_id)) byReceiving.set(it.receiving_id, []);
+    byReceiving.get(it.receiving_id).push(it);
+  }
+
+  /* Also get supplier info for the vendor_receivings */
+  const [supplierRows] = await pool.query(
+    `SELECT s.id, s.company_name FROM suppliers s WHERE s.id IN (${[...new Set(vrRows.map((r) => r.a_supplier_id))].map(() => "?").join(",")})`,
+    [...new Set(vrRows.map((r) => r.a_supplier_id))]
+  );
+  const supplierMap = new Map(supplierRows.map((s) => [s.id, s.company_name]));
+
+  return vrRows.map((vr) => {
+    const items = byReceiving.get(vr.id) ?? [];
+    const supplierName = supplierMap.get(vr.a_supplier_id) ?? vr.a_supplier_name ?? "";
+    const mappedItems = items.map((it) => ({
+      productName: it.product_name,
+      qty: Number(it.received_qty),
+      unit: it.unit,
+      condition: "good",
+      totalQty: Number(it.received_qty),
+    }));
+
+    const totalQty = mappedItems.reduce((a, i) => a + i.qty, 0);
+    const conditionSummary = {
+      good: totalQty,
+      damaged: 0,
+      rejected: 0,
+    };
+
+    return {
+      id: vr.id,
+      arrivalId: vr.arrival_id,
+      supplierId: vr.a_supplier_id ?? "",
+      supplierName,
+      items: mappedItems,
+      totalQty,
+      conditionSummary,
+      kind: "original",
+      replacementRequestId: null,
+      receivedAt: toIso(vr.received_at),
+      receivingBy: vr.received_by,
+      docRef: vr.id,
+      remarks: vr.remarks ?? "",
+    };
+  });
+}
+
+export async function fetchSupplyRequestStatusCounts(vendorId) {
+  const [rows] = await pool.query(
+    `SELECT status, COUNT(*) AS cnt FROM supply_requests WHERE vendor_id = ? GROUP BY status`,
+    [vendorId]
+  );
+  const counts = {};
+  for (const r of rows) {
+    counts[r.status] = Number(r.cnt);
+  }
+  return counts;
+}
+
 async function loadNotifications(vendorId, role = "all") {
   const [rows] = await pool.query(
     "SELECT * FROM notifications WHERE vendor_id = ? AND (recipient = 'all' OR recipient = ?) ORDER BY created_at DESC",
@@ -385,7 +383,7 @@ async function loadProducts(vendorId) {
    supply request — used to derive request fulfillment from real receiving data. */
 async function loadRequestFulfillmentRows(vendorId) {
   const [rows] = await pool.query(
-    `SELECT r.id AS request_id, ri.product_name, ri.unit, ri.qty, ri.condition_value
+    `SELECT a.supply_request_id AS request_id, ri.product_name, ri.unit, ri.qty, ri.condition_value
      FROM receipt_items ri
      JOIN receipts r ON r.id = ri.receipt_id
      JOIN arrivals a ON a.id = r.arrival_id
@@ -443,7 +441,7 @@ export async function fetchSupplyRequestById(id, vendorId) {
 
 export async function fetchBootstrap(user) {
   const vendorId = vendorIdOf(user);
-  const [suppliers, arrivals, receipts, notifications, supplyRequests, products, applications, replacementRequests, vendorReceivings, discrepancyReports] = await Promise.all([
+  const [suppliers, arrivals, receipts, notifications, supplyRequests, products, applications, vendorReceivings] = await Promise.all([
     loadSuppliers(vendorId),
     loadArrivals(vendorId),
     loadReceipts(vendorId),
@@ -451,11 +449,9 @@ export async function fetchBootstrap(user) {
     loadSupplyRequests(vendorId),
     loadProducts(vendorId),
     fetchApplications(user),
-    listReplacementRequests(user),
     listVendorReceivings(user),
-    listDiscrepancies(user),
   ]);
-  return { suppliers, arrivals, receipts, notifications, supplyRequests, products, applications, replacementRequests, vendorReceivings, discrepancyReports };
+  return { suppliers, arrivals, receipts, notifications, supplyRequests, products, applications, vendorReceivings };
 }
 
 export async function fetchReceiptById(id, vendorId) {
@@ -667,320 +663,6 @@ async function syncArrivalStatus(conn, arrivalId) {
   await conn.query("UPDATE arrivals SET status = ? WHERE id = ?", [status, arrivalId]);
 }
 
-/* Re-sync OPEN replacement requests after a correction. The replacement
-   requirement and the accepted snapshot are always derived from the ORIGINAL
-   receipts, never typed. Requests whose product was corrected to be fully
-   received are cancelled (nothing owed); requests already covered by received
-   replacement units are completed. */
-async function resyncReplacementRequests(conn, arrivalId) {
-  const sums = await arrivalProductSums(conn, arrivalId);
-  const [requests] = await conn.query(
-    `SELECT rr.id, rr.product_name, rr.unit FROM replacement_requests rr
-     WHERE rr.arrival_id = ? AND rr.status NOT IN ('completed', 'cancelled')`,
-    [arrivalId]
-  );
-  if (requests.length === 0) return;
-  for (const req of requests) {
-    const bucket = sums.get(`${req.product_name}::${req.unit}`);
-    if (!bucket) continue;
-    const required = round3(Math.max(0, bucket.expected - bucket.originalGood));
-    const [[recv]] = await conn.query(
-      `SELECT COALESCE(SUM(ri.qty), 0) AS s
-       FROM receipt_items ri
-       JOIN receipts r ON r.id = ri.receipt_id
-       WHERE r.replacement_request_id = ? AND ri.condition_value = 'good'`,
-      [req.id]
-    );
-    const received = round3(Number(recv.s));
-    if (required <= 0 && received <= 0) {
-      await conn.query("UPDATE replacement_requests SET status = 'cancelled' WHERE id = ?", [req.id]);
-    } else if (received >= required) {
-      await conn.query("UPDATE replacement_requests SET status = 'completed' WHERE id = ?", [req.id]);
-    } else {
-      await conn.query(
-        `UPDATE replacement_requests
-         SET accepted_qty = ?, damaged_qty = ?, replacement_qty = ?,
-             status = CASE WHEN status = 'completed' THEN 'requested' ELSE status END
-         WHERE id = ?`,
-        [bucket.originalGood, bucket.damaged, required, req.id]
-      );
-    }
-  }
-}
-
-const RPL_PREFIX = "RPL";
-
-async function replacementOpenQuery(conn, arrivalId, productName, unit) {
-  return conn.query(
-    `SELECT id FROM replacement_requests
-     WHERE arrival_id = ? AND product_name = ? AND unit = ? AND status NOT IN ('completed', 'cancelled')
-     LIMIT 1`,
-    [arrivalId, productName, unit]
-  );
-}
-
-/* Received replacement units per request (good only), one row each. */
-async function replacementReceivedMap(conn) {
-  const [rows] = await conn.query(
-    `SELECT r.replacement_request_id AS rid, COALESCE(SUM(ri.qty), 0) AS received
-     FROM receipts r
-     JOIN receipt_items ri ON ri.receipt_id = r.id
-     WHERE r.replacement_request_id IS NOT NULL AND ri.condition_value = 'good'
-     GROUP BY r.replacement_request_id`
-  );
-  return new Map(rows.map((r) => [r.rid, round3(Number(r.received))]));
-}
-
-export async function listReplacementRequests(user, { arrivalId } = {}) {
-  const vendorId = vendorIdOf(user);
-  const params = [vendorId];
-  let arrivalClause = "";
-  if (arrivalId) {
-    arrivalClause = "AND rr.arrival_id = ?";
-    params.push(arrivalId);
-  }
-  const [rows] = await pool.query(
-    `SELECT rr.*, a.source_ref, a.supplier_name, a.supplier_id
-     FROM replacement_requests rr
-     JOIN arrivals a ON a.id = rr.arrival_id
-     WHERE rr.vendor_id = ? ${arrivalClause}
-     ORDER BY rr.requested_at DESC, rr.id DESC`,
-    params
-  );
-  const received = await replacementReceivedMap(pool);
-  return rows.map((r) => mapReplacementRequest(r, received.get(r.id) ?? 0));
-}
-
-export async function createReplacementRequest(arrivalId, body, user) {
-  const vendorId = vendorIdOf(user);
-  const productName = typeof body.productName === "string" ? body.productName.trim() : "";
-  const unit = typeof body.unit === "string" ? body.unit.trim() : "";
-  const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 500) : "";
-  const remarks = typeof body.remarks === "string" ? body.remarks.trim().slice(0, 500) : "";
-  if (!productName || !unit) throw httpError(400, "Product and unit are required for a replacement request.");
-  if (!reason) throw httpError(400, "A reason is required for the replacement request (e.g. damaged in transit).");
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    const [arr] = await conn.query(
-      "SELECT id, supplier_id, supplier_name, source_ref, status FROM arrivals WHERE id = ? AND vendor_id = ?",
-      [arrivalId, vendorId]
-    );
-    if (arr.length === 0) throw httpError(403, "Unknown or unauthorized expected supply reference.");
-    const [arrItem] = await conn.query(
-      "SELECT product_name, unit, qty FROM arrival_items WHERE arrival_id = ? AND product_name = ? AND unit = ?",
-      [arrivalId, productName, unit]
-    );
-    if (arrItem.length === 0) throw httpError(400, "The product is not part of this delivery.");
-
-    const sums = await arrivalProductSums(conn, arrivalId);
-    const bucket = sums.get(`${productName}::${unit}`);
-    const required = round3(Math.max(0, bucket.expected - bucket.originalGood));
-    if (required <= 0) {
-      throw httpError(400, "No replacement is required for this product — the full expected quantity has already been accepted as good.");
-    }
-
-    const [open] = await replacementOpenQuery(conn, arrivalId, productName, unit);
-    if (open.length > 0) {
-      throw httpError(409, `An open replacement request already exists for "${productName}" on this delivery.`);
-    }
-
-    const id = genId(RPL_PREFIX);
-    await conn.query(
-      `INSERT INTO replacement_requests
-       (id, arrival_id, product_name, unit, expected_qty, accepted_qty, damaged_qty,
-        replacement_qty, reason, remarks, status, requested_by, requested_at, vendor_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?)`,
-      [id, arrivalId, productName, unit, bucket.expected, bucket.originalGood, bucket.damaged,
-        required, reason, remarks, user.name ?? user.sub ?? "receiving_staff",
-        toDbDateTime(new Date()), vendorId]
-    );
-    await conn.commit();
-    const [created] = await pool.query(
-      "SELECT * FROM replacement_requests WHERE id = ?",
-      [id]
-    );
-    const receivedMap = await replacementReceivedMap(pool);
-    await logAudit({
-      user,
-      action: "replacement.requested",
-      entityType: "arrival",
-      entityId: arrivalId,
-      detail: `Requested ${required} ${unit} replacement for "${productName}" on ${arrivalId}.`,
-      ip: user?.ip ?? "",
-    });
-    return mapReplacementRequest(created[0], receivedMap.get(id) ?? 0);
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
-  }
-}
-
-export async function fetchReplacementRequestById(id, user) {
-  const vendorId = vendorIdOf(user);
-  const [rows] = await pool.query(
-    `SELECT rr.*, a.source_ref, a.supplier_name, a.supplier_id
-     FROM replacement_requests rr JOIN arrivals a ON a.id = rr.arrival_id
-     WHERE rr.id = ? AND rr.vendor_id = ?`,
-    [id, vendorId]
-  );
-  if (rows.length === 0) return null;
-  const receivedMap = await replacementReceivedMap(pool);
-  return mapReplacementRequest(rows[0], receivedMap.get(id) ?? 0);
-}
-
-export async function cancelReplacementRequest(id, body, user) {
-  const vendorId = vendorIdOf(user);
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    const [rows] = await conn.query(
-      "SELECT * FROM replacement_requests WHERE id = ? AND vendor_id = ?",
-      [id, vendorId]
-    );
-    if (rows.length === 0) throw httpError(403, "Replacement request not found or not in scope.");
-    const req = rows[0];
-    if (req.status === "completed" || req.status === "cancelled") {
-      throw httpError(409, "This replacement request has already finished and cannot be cancelled.");
-    }
-    const [[recv]] = await conn.query(
-      `SELECT COALESCE(SUM(ri.qty),0) AS s FROM receipt_items ri
-       JOIN receipts r ON r.id = ri.receipt_id
-       WHERE r.replacement_request_id = ? AND ri.condition_value = 'good'`,
-      [id]
-    );
-    if (Number(recv.s) > 0) {
-      throw httpError(409, "Replacement units were already received against this request. Correct the receiving record instead.");
-    }
-    await conn.query("UPDATE replacement_requests SET status = 'cancelled' WHERE id = ?", [id]);
-    await conn.commit();
-    await logAudit({
-      user,
-      action: "replacement.cancelled",
-      entityType: "arrival",
-      entityId: req.arrival_id,
-      detail: `Cancelled replacement request ${id} for "${req.product_name}".`,
-      ip: user?.ip ?? "",
-    });
-    return fetchReplacementRequestById(id, user);
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
-  }
-}
-
-/* Receive replacement units against an open request. The quantity is auto-filled
-   to the remaining amount but may be reduced. This creates a kind='replacement'
-   receiving record — the replacement units become good stock. The receiving
-   ceiling (good + damaged ≤ expected) never applies here because replacement
-   units are explicitly bounded by remaining. */
-export async function receiveReplacement(id, body, user) {
-  const vendorId = vendorIdOf(user);
-  const requestedQty = toNumber(body.qty);
-  const receivedAt = toDbDateTime(body.receivedAt ?? "");
-  const receivingBy = typeof body.receivingBy === "string" ? body.receivingBy.trim() : "";
-  const remarks = typeof body.remarks === "string" ? body.remarks.trim().slice(0, 500) : "";
-  if (requestedQty === null || requestedQty <= 0) {
-    throw httpError(400, "Replacement quantity must be positive.");
-  }
-  if (!receivedAt) throw httpError(400, "Replacement received date/time is required.");
-  if (!receivingBy) throw httpError(400, "Received by is required before confirming the replacement receipt.");
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    const [rows] = await conn.query(
-      `SELECT rr.*, a.supplier_id, a.supplier_name, a.status AS arrival_status
-       FROM replacement_requests rr JOIN arrivals a ON a.id = rr.arrival_id
-       WHERE rr.id = ? AND rr.vendor_id = ?`,
-      [id, vendorId]
-    );
-    if (rows.length === 0) throw httpError(403, "Replacement request not found or not in scope.");
-    const req = rows[0];
-    if (req.arrival_status === "reopened") {
-      throw httpError(409, "This delivery is under an inspection correction. Finish or cancel the correction before receiving replacement units.");
-    }
-    if (req.status === "completed" || req.status === "cancelled") {
-      throw httpError(409, "This replacement request is already finished and cannot receive units.");
-    }
-    if (!REPLACEMENT_OPEN.includes(req.status)) {
-      throw httpError(409, `Replacement request is in status "${req.status}" and cannot receive units yet.`);
-    }
-
-    const [[recv]] = await conn.query(
-      `SELECT COALESCE(SUM(ri.qty), 0) AS s FROM receipt_items ri
-       JOIN receipts r ON r.id = ri.receipt_id
-       WHERE r.replacement_request_id = ? AND ri.condition_value = 'good'`,
-      [id]
-    );
-    const received = round3(Number(recv.s));
-    const remaining = round3(Number(req.replacement_qty) - received);
-    if (remaining <= 0) {
-      throw httpError(409, "This replacement request has already been fully received.");
-    }
-    if (requestedQty > remaining) {
-      throw httpError(
-        400,
-        `Replacement quantity (${requestedQty} ${req.unit}) exceeds the remaining replacement quantity of ${remaining} ${req.unit}.`
-      );
-    }
-
-    const receiptId = genId("RCV");
-    await conn.query(
-      `INSERT INTO receipts
-       (id, arrival_id, supplier_id, supplier_name, status, total_qty, received_at,
-        receiving_by, doc_ref, remarks, kind, replacement_request_id, vendor_id)
-       VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, 'replacement', ?, ?)`,
-      [receiptId, req.arrival_id, req.supplier_id, req.supplier_name, requestedQty,
-        receivedAt, receivingBy, req.arrival_id, remarks, id, vendorId]
-    );
-    await conn.query(
-      `INSERT INTO receipt_items (receipt_id, product_name, qty, total_received_quantity, unit, condition_value, return_to_sc)
-       VALUES (?, ?, ?, ?, ?, 'good', 0)`,
-      [receiptId, req.product_name, requestedQty, requestedQty, req.unit]
-    );
-
-    const newReceived = round3(received + requestedQty);
-    const newRemaining = round3(Number(req.replacement_qty) - newReceived);
-    const nextStatus = newRemaining <= 0 ? "completed" : "received";
-    await conn.query("UPDATE replacement_requests SET status = ? WHERE id = ?", [nextStatus, id]);
-    await syncArrivalStatus(conn, req.arrival_id);
-    await conn.commit();
-
-    await logAudit({
-      user,
-      action: "replacement.received",
-      entityType: "arrival",
-      entityId: req.arrival_id,
-      detail: `Received ${requestedQty} ${req.unit} replacement units for "${req.product_name}" (request ${id}, receipt ${receiptId}).`,
-      ip: user?.ip ?? "",
-    });
-    await notifyReplacementReceived(req, requestedQty, newRemaining, receiptId);
-    return fetchReplacementRequestById(id, user);
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
-  }
-}
-
-/* Notification for a received replacement — read by receiving_staff dashboard
-   and the Supply Chain panel of the app. */
-async function notifyReplacementReceived(req, qty, remaining, receiptId) {
-  await createNotification(pool, {
-    title: "Replacement Units Received",
-    message: `Replacement of ${qty} ${req.unit} for "${req.product_name}" received on ${req.arrival_id} (receipt ${receiptId}).${remaining > 0 ? ` ${remaining} ${req.unit} still expected.` : ""}`,
-    type: "success",
-    vendorId: req.vendor_id ?? "",
-  });
-}
-
 /* ── Vendor Receiving acknowledgments ─────────────────────
    The Vendor acknowledges ACCEPTED stock (the checker result). The quantity a
    Vendor may receive is bound server-side to
@@ -990,7 +672,6 @@ async function notifyReplacementReceived(req, qty, remaining, receiptId) {
    The frontend always supplies an idempotency key (a client-generated receiving
    id) so a retried click / refresh can never create a duplicate transaction. */
 const VRCEIVING_REF_PREFIX = "VRC";
-const DISCREPANCY_REF_PREFIX = "DSP";
 
 export async function listVendorReceivings(user, { arrivalId } = {}) {
   const vendorId = vendorIdOf(user);
@@ -1092,9 +773,8 @@ export async function createVendorReceiving(arrivalId, body, user) {
       }
     }
 
-    if (arr[0].status === "reopened") {
-      throw httpError(409, "This delivery is under an inspection correction. Finish the correction before confirming Vendor receiving.");
-    }
+    /* The delivery must already carry a Checker result — the Vendor only ever
+       acknowledges accepted stock, so it can never be the first to record it. */
     const [[anyInspection]] = await conn.query(
       "SELECT COUNT(*) AS c FROM receipts WHERE arrival_id = ?",
       [arrivalId]
@@ -1184,580 +864,11 @@ export async function createVendorReceiving(arrivalId, body, user) {
   }
 }
 
-/* ── Discrepancy reports ──────────────────────────────────
-   The Vendor can never modify the Checker's accepted/damaged quantities. When a
-   mismatch is noticed, a traceable report is routed to the responsible
-   subsystem instead of a vendor-side reopen. Read-only origin data. */
-const DISCREPANCY_TYPES = ["quantity_mismatch", "damage_dispute", "wrong_product", "missing_items", "documentation", "other"];
-
-export async function createDiscrepancy(arrivalId, body, user) {
-  const vendorId = vendorIdOf(user);
-  const discrepancyType = typeof body.discrepancyType === "string" ? body.discrepancyType.trim() : "";
-  const description = typeof body.description === "string" ? body.description.trim() : "";
-  const requestedCorrection = typeof body.requestedCorrection === "string" ? body.requestedCorrection.trim().slice(0, 1000) : "";
-  const receiptId = typeof body.receiptId === "string" && body.receiptId.trim() ? body.receiptId.trim() : null;
-  if (!discrepancyType || !DISCREPANCY_TYPES.includes(discrepancyType)) {
-    throw httpError(400, "Select a valid discrepancy type.");
-  }
-  if (!description) throw httpError(400, "Describe the discrepancy — at least a short description is required.");
-  if (description.length > 1000) throw httpError(400, "Discrepancy description must be 1000 characters or fewer.");
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    const [arr] = await conn.query(
-      "SELECT id, supplier_name, status FROM arrivals WHERE id = ? AND vendor_id = ?",
-      [arrivalId, vendorId]
-    );
-    if (arr.length === 0) throw httpError(403, "Unknown or unauthorized delivery reference.");
-    if (receiptId) {
-      const [[rec]] = await conn.query(
-        "SELECT COUNT(*) AS c FROM receipts WHERE id = ? AND arrival_id = ? AND vendor_id = ?",
-        [receiptId, arrivalId, vendorId]
-      );
-      if (Number(rec.c) === 0) throw httpError(400, "The referenced inspection record does not belong to this delivery.");
-    }
-    const id = genId(DISCREPANCY_REF_PREFIX);
-    await conn.query(
-      `INSERT INTO discrepancy_reports
-       (id, arrival_id, receipt_id, discrepancy_type, description, requested_correction,
-        reported_by, reported_at, status, vendor_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'submitted', ?)`,
-      [id, arrivalId, receiptId, discrepancyType, description, requestedCorrection,
-        user.name ?? user.sub ?? "receiving_staff", toDbDateTime(new Date()), vendorId]
-    );
-    await conn.commit();
-    await createNotification(pool, {
-      title: "Discrepancy Reported",
-      message: `Discrepancy reported against ${arrivalId} (${arr[0].supplier_name}): ${discrepancyType.replace(/_/g, " ")}. Routed to the responsible subsystem.`,
-      type: "warning",
-      vendorId,
-      recipient: "all",
-    });
-    await logAudit({
-      user,
-      action: "receiving.discrepancy",
-      entityType: "arrival",
-      entityId: arrivalId,
-      detail: `Reported discrepancy "${discrepancyType}" on ${arrivalId} (${id}): ${description.slice(0, 120)}.`,
-      ip: user?.ip ?? "",
-    });
-    return fetchDiscrepancyById(id, user);
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
-  }
-}
-
-export async function fetchDiscrepancyById(id, user) {
-  const vendorId = vendorIdOf(user);
-  const [rows] = await pool.query(
-    `SELECT dr.*, a.supplier_name, a.source_ref FROM discrepancy_reports dr
-     JOIN arrivals a ON a.id = dr.arrival_id
-     WHERE dr.id = ? AND dr.vendor_id = ?`,
-    [id, vendorId]
-  );
-  return rows.length ? mapDiscrepancy(rows[0]) : null;
-}
-
-export async function listDiscrepancies(user) {
-  const vendorId = vendorIdOf(user);
-  const [rows] = await pool.query(
-    `SELECT dr.*, a.supplier_name, a.source_ref FROM discrepancy_reports dr
-     JOIN arrivals a ON a.id = dr.arrival_id
-     WHERE dr.vendor_id = ?
-     ORDER BY dr.reported_at DESC, dr.id DESC`,
-    [vendorId]
-  );
-  return rows.map(mapDiscrepancy);
-}
-
 async function createNotification(conn, notif) {
   await conn.query(
     "INSERT INTO notifications (id, title, message, type, is_read, vendor_id, recipient, created_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
     [genNotifId(), notif.title, notif.message, notif.type, notif.vendorId ?? "", notif.recipient ?? "all", toDbDateTime(new Date())]
   );
-}
-
-export function validateReceiptPayload(body, { requireId = false } = {}) {
-  const errors = {};
-
-  const id = typeof body.id === "string" ? body.id.trim() : "";
-  if (requireId && !id) errors.id = "Receiving reference id is required.";
-  else if (id && !/^[A-Za-z0-9:_-]{1,40}$/.test(id)) errors.id = "Invalid receiving reference format.";
-
-  const supplierId = typeof body.supplierId === "string" ? body.supplierId.trim() : "";
-  if (!supplierId) errors.supplier_id = "Supplier is required.";
-
-  const arrivalId = typeof body.arrivalId === "string" && body.arrivalId.trim() ? body.arrivalId.trim() : null;
-
-  const items = [];
-  if (!Array.isArray(body.items) || body.items.length === 0) {
-    errors.items = "At least one receiving item is required.";
-  } else {
-    for (const raw of body.items) {
-      const i = raw ?? {};
-      const productName = typeof i.productName === "string" ? i.productName.trim() : "";
-      const unit = typeof i.unit === "string" ? i.unit.trim() : "";
-      const condition = typeof i.condition === "string" ? i.condition : "";
-      const returnToSc = Boolean(i.returnToSc);
-      const declaredTotal = toNumber(i.totalQty);
-      const parsed = parseItemQty(toNumber(i.qty), unit);
-
-      if (!productName) { errors.items = "Each item needs a product name."; break; }
-      if (productName.length > 180) { errors.items = "Product name is too long."; break; }
-      if (!unit || unit.length > 20) { errors.items = "Each item needs a valid unit."; break; }
-      if (!CONDITIONS.includes(condition)) { errors.items = "Invalid receiving condition."; break; }
-      if (parsed.qty === null) { errors.items = parsed.message; break; }
-      if (declaredTotal !== null && declaredTotal <= 0) {
-        errors.items = "Declared total quantity for an item must be positive.";
-        break;
-      }
-      items.push({ productName, qty: parsed.qty, unit, condition, returnToSc, declaredTotal });
-    }
-  }
-
-  const receivedAt = toDbDateTime(body.receivedAt ?? body.received_on ?? "");
-  if (!receivedAt) errors.received_at = "Received date/time is required and must be valid.";
-
-  const receivingBy = typeof body.receivingBy === "string" ? body.receivingBy.trim() : "";
-  if (!receivingBy) errors.received_by = "Received by is required before confirming the receiving record.";
-
-  /* Document/reference number. When the record is tied to a Supply Chain
-     delivery the reference ALWAYS comes from that delivery (SC-DLV-…); the
-     vendor never retypes it. Ad-hoc receipts still require a typed ref. */
-  let docRef = typeof body.docRef === "string" ? body.docRef.trim().slice(0, 120) : "";
-  if (!docRef && arrivalId) docRef = arrivalId;
-  if (!docRef) errors.supplier_reference = "Supplier reference is required before confirming the receiving record.";
-
-  const remarks = typeof body.remarks === "string" ? body.remarks.trim().slice(0, 500) : "";
-  if (!remarks) errors.remarks = "Remarks are required before confirming the receiving record.";
-
-  if (items.length > 0) {
-    const mismatch = validateConditionBreakdown(items);
-    if (mismatch) errors.items = mismatch;
-  }
-
-  if (Object.keys(errors).length > 0) {
-    const keys = ["id", "supplier_id", "supplier_reference", "received_at", "received_by", "remarks", "items"];
-    const message = keys.map((k) => errors[k]).find(Boolean) ?? errors[Object.keys(errors)[0]];
-    throw httpError(400, message, { errors });
-  }
-
-  const totalQty = round3(items.reduce((a, i) => a + i.qty, 0));
-
-  return { id, arrivalId, supplierId, items, receivedAt, receivingBy, docRef, remarks, totalQty };
-}
-
-export async function createReceipt(body, user) {
-  const data = validateReceiptPayload(body, { requireId: true });
-  const vendorId = vendorIdOf(user);
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [dup] = await conn.query("SELECT id FROM receipts WHERE id = ?", [data.id]);
-    if (dup.length > 0) throw httpError(409, "Receiving reference already exists.");
-
-    const [sup] = await conn.query("SELECT id, company_name FROM suppliers WHERE id = ? AND vendor_id = ?", [data.supplierId, vendorId]);
-    if (sup.length === 0) throw httpError(403, "Unknown or unauthorized supplier reference.");
-
-    let arrivalRef = "";
-    if (data.arrivalId) {
-      const [arr] = await conn.query("SELECT id, supplier_id, status FROM arrivals WHERE id = ? AND vendor_id = ?", [data.arrivalId, vendorId]);
-      if (arr.length === 0) throw httpError(403, "Unknown or unauthorized expected supply reference.");
-      arrivalRef = arr[0].id;
-      if (arr[0].supplier_id !== data.supplierId) {
-        throw httpError(400, "Expected supply does not match the selected supplier.");
-      }
-      if (arr[0].status === "completed") {
-        throw httpError(400, "This delivery has already been completed. Reopen it for correction instead of creating a new receiving record.");
-      }
-      if (arr[0].status === "reopened") {
-        throw httpError(409, "This delivery is reopened for correction. Edit and save the existing receiving record — do not create a new one.");
-      }
-      await assertWithinArrivalExpected(conn, data.arrivalId, data.items);
-    }
-
-    /* Reference comes from the linked Supply Chain delivery (SC-DLV-…). */
-    const effectiveDocRef = data.arrivalId ? arrivalRef : data.docRef;
-
-    await conn.query(
-      `INSERT INTO receipts
-        (id, arrival_id, supplier_id, supplier_name, status, total_qty, received_at, receiving_by, doc_ref, remarks, vendor_id)
-       VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, ?)`,
-      [data.id, data.arrivalId, data.supplierId, sup[0].company_name, data.totalQty,
-        data.receivedAt, data.receivingBy, effectiveDocRef, data.remarks, vendorId]
-    );
-
-    const groupTotals = itemGroupTotals(data.items);
-    for (const it of data.items) {
-      const totalReceived = groupTotals.find(
-        (g) => g.productName === it.productName && g.unit === it.unit
-      )?.totalReceived;
-      await conn.query(
-        "INSERT INTO receipt_items (receipt_id, product_name, qty, total_received_quantity, unit, condition_value, return_to_sc) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [data.id, it.productName, it.qty, totalReceived, it.unit, it.condition, it.returnToSc ? 1 : 0]
-      );
-    }
-
-    if (data.arrivalId) {
-      await syncArrivalStatus(conn, data.arrivalId);
-      await resyncReplacementRequests(conn, data.arrivalId);
-    }
-
-    await createNotification(conn, {
-      title: "Receiving Recorded",
-      message: `${sup[0].company_name} - ${data.totalQty} units received${data.arrivalId ? ` against ${data.arrivalId}` : ""} (${data.id}).`,
-      type: data.items.some((i) => i.condition !== "good") ? "error" : "success",
-      vendorId,
-      recipient: "all",
-    });
-
-    await logAudit({
-      conn,
-      user,
-      action: "receiving.create",
-      entityType: "receipt",
-      entityId: data.id,
-      detail: `Recorded ${data.totalQty} units from ${sup[0].company_name} (${data.items.length} item line(s)).`,
-      ip: user?.ip ?? "",
-    });
-
-    await conn.commit();
-    return fetchReceiptById(data.id, vendorId);
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
-}
-
-export async function updateReceipt(id, body, user) {
-  const data = validateReceiptPayload(body);
-  const vendorId = vendorIdOf(user);
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [existing] = await conn.query(
-      `SELECT id, status, total_qty, arrival_id, reopen_reason, reopen_remarks, reopened_by, reopened_at, vendor_id
-       FROM receipts WHERE id = ?`,
-      [id]
-    );
-    if (existing.length === 0) throw httpError(404, "Receiving transaction not found.");
-    const rec = existing[0];
-    assertVendorScope(rec.vendor_id, user);
-    if (rec.status === "completed") {
-      throw httpError(409, "A completed receiving transaction cannot be edited.");
-    }
-
-    /* A receiving record may only be edited while its linked delivery is in
-       the reopened state. This is a CORRECTION of the same transaction — the
-       existing receiving reference is kept and quantities are replaced, never
-       added to. */
-    let arrivalStatus = null;
-    if (rec.arrival_id) {
-      const [arr] = await conn.query("SELECT id, supplier_id, status FROM arrivals WHERE id = ? AND vendor_id = ?", [rec.arrival_id, vendorId]);
-      if (arr.length === 0) throw httpError(403, "Unknown or unauthorized expected supply reference.");
-      arrivalStatus = arr[0].status;
-      if (arr[0].supplier_id !== data.supplierId) {
-        throw httpError(400, "Expected supply does not match the selected supplier.");
-      }
-    }
-    if (arrivalStatus !== "reopened") {
-      throw httpError(409, "This receiving record can only be edited after the delivery has been reopened for correction.");
-    }
-
-    const [sup] = await conn.query("SELECT id, company_name FROM suppliers WHERE id = ? AND vendor_id = ?", [data.supplierId, vendorId]);
-    if (sup.length === 0) throw httpError(403, "Unknown or unauthorized supplier reference.");
-
-    const [oldItems] = await conn.query(
-      "SELECT product_name, qty, unit, condition_value AS `condition` FROM receipt_items WHERE receipt_id = ? ORDER BY id",
-      [id]
-    );
-
-    /* Corrections are still subject to the SAME receiving validation: the
-       corrected totals can never exceed the Supply Chain expected quantity.
-       The record being corrected is excluded from the already-received sums so
-       its OLD values don't block a valid correction (e.g. 100 → 150 on a 150
-       delivery), yet 300 would still be rejected. Reopen fixes details — it
-       never bypasses the ceiling. */
-    if (rec.arrival_id) {
-      await assertWithinArrivalExpected(conn, rec.arrival_id, data.items, id);
-    }
-
-    const oldTotal = round3(Number(rec.total_qty));
-    const oldGood = sumQtyByCondition(oldItems, ["good"]);
-    const oldDamaged = sumQtyByCondition(oldItems, ["damaged", "rejected"]);
-
-    /* The SC delivery reference is preserved on correction — the vendor never
-       retypes it, and reopening never requires re-entering SC information. */
-    const effectiveDocRef = rec.arrival_id || data.docRef;
-
-    await conn.query(
-      `UPDATE receipts
-       SET supplier_id = ?, supplier_name = ?, status = 'confirmed', total_qty = ?, received_at = ?,
-           receiving_by = ?, doc_ref = ?, remarks = ?
-       WHERE id = ?`,
-      [data.supplierId, sup[0].company_name, data.totalQty,
-        data.receivedAt, data.receivingBy, effectiveDocRef, data.remarks, id]
-    );
-
-    /* Corrections replace the item rows in the SAME receipt — same receiving
-       reference, same delivery, never a duplicate transaction. */
-    await conn.query("DELETE FROM receipt_items WHERE receipt_id = ?", [id]);
-    const groupTotals = itemGroupTotals(data.items);
-    for (const it of data.items) {
-      const totalReceived = groupTotals.find(
-        (g) => g.productName === it.productName && g.unit === it.unit
-      )?.totalReceived;
-      await conn.query(
-        "INSERT INTO receipt_items (receipt_id, product_name, qty, total_received_quantity, unit, condition_value, return_to_sc) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [id, it.productName, it.qty, totalReceived, it.unit, it.condition, it.returnToSc ? 1 : 0]
-      );
-    }
-
-    const newTotal = round3(Number(data.totalQty));
-    const newGood = sumQtyByCondition(data.items, ["good"]);
-    const newDamaged = sumQtyByCondition(data.items, ["damaged", "rejected"]);
-    const goodAdjustment = round3(newGood - oldGood);
-
-    /* A saved correction re-derives the delivery status from its actual receipts
-       (completed only when every product is fully covered by good units) and
-       re-syncs any open replacement requests to the corrected numbers. */
-    if (rec.arrival_id) {
-      await syncArrivalStatus(conn, rec.arrival_id);
-      await resyncReplacementRequests(conn, rec.arrival_id);
-    }
-
-    const savedBy = user?.username ?? "";
-    await conn.query(
-      `INSERT INTO receipt_corrections
-        (receipt_id, arrival_id, reopen_reason, reopen_remarks, reopened_by, reopened_at,
-         saved_by, saved_at, old_total_qty, new_total_qty, old_good_qty, new_good_qty,
-         old_damaged_qty, new_damaged_qty, good_adjustment, old_items, new_items)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, rec.arrival_id, rec.reopen_reason, rec.reopen_remarks, rec.reopened_by, rec.reopened_at,
-        savedBy, oldTotal, newTotal, oldGood, newGood, oldDamaged, newDamaged, goodAdjustment,
-        JSON.stringify(oldItems), JSON.stringify(data.items)]
-    );
-
-    await createNotification(conn, {
-      title: "Receiving Corrected",
-      message:
-        `${sup[0].company_name} - ${id} corrected (${oldTotal} → ${newTotal} units; ` +
-        `good ${oldGood} → ${newGood} ${goodAdjustment >= 0 ? "+" : ""}${goodAdjustment}). ` +
-        `Reason: ${rec.reopen_reason || "Receiving correction"}.`,
-      type: "info",
-      vendorId,
-      recipient: "all",
-    });
-
-    await logAudit({
-      conn,
-      user,
-      action: "receiving.correction",
-      entityType: "receipt",
-      entityId: id,
-      detail:
-        `Corrected ${id} (delivery ${rec.arrival_id}): total ${oldTotal} → ${newTotal}, ` +
-        `good ${oldGood} → ${newGood} (adjustment ${goodAdjustment >= 0 ? "+" : ""}${goodAdjustment}), ` +
-        `damaged ${oldDamaged} → ${newDamaged}. Reason: "${rec.reopen_reason}". ` +
-        `Reopened by ${rec.reopened_by || "—"}, saved by ${savedBy}.`,
-      ip: user?.ip ?? "",
-    });
-
-    await conn.commit();
-    return fetchReceiptById(id, vendorId);
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
-}
-
-/* Reopen a delivery for receiving correction. The existing receiving record
-   (the one provided, or the latest one for the delivery) is retained and
-   edited in place — no new receiving transaction is created. */
-export async function reopenArrival(id, receiptId, reason, remarks, user) {
-  const vendorId = vendorIdOf(user);
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [arr] = await conn.query("SELECT id, vendor_id FROM arrivals WHERE id = ?", [id]);
-    if (arr.length === 0) throw httpError(404, "Expected supply not found.");
-    assertVendorScope(arr[0].vendor_id, user);
-
-    const reasonText = typeof reason === "string" ? reason.trim() : "";
-    if (!reasonText) throw httpError(400, "A reason for reopening is required.");
-    if (reasonText.length > 500) throw httpError(400, "Reopen reason must be 500 characters or fewer.");
-    const remarksText = typeof remarks === "string" ? remarks.trim() : "";
-    if (remarksText.length > 500) throw httpError(400, "Reopen remarks must be 500 characters or fewer.");
-
-    let receiptIdFinal = receiptId;
-    if (!receiptIdFinal) {
-      const [latest] = await conn.query(
-        "SELECT id FROM receipts WHERE arrival_id = ? ORDER BY received_at DESC, id DESC LIMIT 1",
-        [id]
-      );
-      if (latest.length === 0) throw httpError(400, "No receiving transaction exists for this delivery yet.");
-      receiptIdFinal = latest[0].id;
-    }
-    const [rec] = await conn.query("SELECT id, arrival_id, vendor_id FROM receipts WHERE id = ?", [receiptIdFinal]);
-    if (rec.length === 0) throw httpError(404, "Receiving transaction not found.");
-    assertVendorScope(rec[0].vendor_id, user);
-    if (rec[0].arrival_id !== id) {
-      throw httpError(400, "That receiving record does not belong to this delivery.");
-    }
-
-    const reopenedBy = user?.username ?? "";
-    await conn.query("UPDATE arrivals SET status = 'reopened' WHERE id = ?", [id]);
-    await conn.query(
-      "UPDATE receipts SET reopen_reason = ?, reopen_remarks = ?, reopened_by = ?, reopened_at = NOW() WHERE id = ?",
-      [reasonText, remarksText, reopenedBy, receiptIdFinal]
-    );
-
-    await createNotification(conn, {
-      title: "Delivery Reopened for Correction",
-      message: `${id} reopened for receiving correction (${receiptIdFinal}) - reason: ${reasonText}.`,
-      type: "warning",
-      vendorId,
-      recipient: "all",
-    });
-
-    await logAudit({
-      conn,
-      user,
-      action: "receiving.reopen",
-      entityType: "receipt",
-      entityId: receiptIdFinal,
-      detail: `Reopened ${receiptIdFinal} for correction (delivery ${id}). Reason: ${reasonText}.`,
-      ip: user?.ip ?? "",
-    });
-
-    await conn.commit();
-    return { ok: true, receiptId: receiptIdFinal };
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
-}
-
-export async function confirmReceipt(id, user) {
-  const vendorId = vendorIdOf(user);
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [rows] = await conn.query(
-      "SELECT id, arrival_id, supplier_id, supplier_name, received_at, receiving_by, doc_ref, remarks, status, vendor_id FROM receipts WHERE id = ?",
-      [id]
-    );
-    if (rows.length === 0) throw httpError(404, "Receiving transaction not found.");
-    const row = rows[0];
-    assertVendorScope(row.vendor_id, user);
-
-    if (row.status === "confirmed" || row.status === "completed") {
-      throw httpError(409, "This receiving transaction is already confirmed.");
-    }
-    if (!RECEIPT_STATUSES.includes(row.status)) {
-      throw httpError(400, `Unknown receiving status "${row.status}".`);
-    }
-
-    const [items] = await conn.query(
-      "SELECT product_name, qty, total_received_quantity, unit, condition_value FROM receipt_items WHERE receipt_id = ? ORDER BY id",
-      [id]
-    );
-
-    validateReceiptPayload({
-      id,
-      supplierId: row.supplier_id,
-      arrivalId: row.arrival_id ?? "",
-      receivedAt: row.received_at,
-      receivingBy: row.receiving_by,
-      docRef: row.doc_ref,
-      remarks: row.remarks,
-      items: items.map((i) => ({
-        productName: i.product_name,
-        qty: Number(i.qty),
-        unit: i.unit,
-        condition: i.condition_value,
-        totalQty: i.total_received_quantity == null ? undefined : Number(i.total_received_quantity),
-      })),
-    });
-
-    await conn.query("UPDATE receipts SET status = 'confirmed' WHERE id = ?", [id]);
-
-    await createNotification(conn, {
-      title: "Receiving Confirmed",
-      message: `${row.supplier_name} - ${id} confirmed.`,
-      type: items.some((i) => i.condition_value !== "good") ? "error" : "success",
-      vendorId,
-      recipient: "all",
-    });
-
-    await logAudit({
-      conn,
-      user,
-      action: "receiving.confirm",
-      entityType: "receipt",
-      entityId: id,
-      detail: `Confirmed receiving ${id} (${row.supplier_name}).`,
-      ip: user?.ip ?? "",
-    });
-
-    await conn.commit();
-    return fetchReceiptById(id, vendorId);
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
-}
-
-export async function updateArrivalStatus(id, status, user) {
-  if (!SUPPLY_STATUSES.includes(status)) throw httpError(400, "Invalid supply status.");
-  const [rows] = await pool.query("SELECT id, supplier_name, status, vendor_id FROM arrivals WHERE id = ?", [id]);
-  if (rows.length === 0) throw httpError(404, "Expected supply not found.");
-  assertVendorScope(rows[0].vendor_id, user);
-  const vendorId = vendorIdOf(user);
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    await conn.query("UPDATE arrivals SET status = ? WHERE id = ?", [status, id]);
-    await createNotification(conn, {
-      title: "Supply status updated",
-      message: `${rows[0].supplier_name} (${id}) moved to ${SUPPLY_STATUS_LABEL[status]}.`,
-      type: status === "completed" ? "success" : "info",
-      vendorId,
-      recipient: "all",
-    });
-    await logAudit({
-      conn,
-      user,
-      action: "arrival.status",
-      entityType: "arrival",
-      entityId: id,
-      detail: `Moved expected supply ${id} to ${status}.`,
-      ip: user?.ip ?? "",
-    });
-    await conn.commit();
-    return { ok: true };
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
 }
 
 export async function setSupplierStatus(id, status, user) {
@@ -2103,26 +1214,6 @@ export async function cancelSupplyRequest(id, user) {
 }
 
 /* Reserved for the Supply Chain subsystem — the Vendor API never exposes it. */
-export async function advanceSupplyChainStatus(id, status) {
-  if (!REQUEST_STATUSES.includes(status)) throw httpError(400, "Invalid request status.");
-  const [rows] = await pool.query("SELECT id, status FROM supply_requests WHERE id = ?", [id]);
-  if (rows.length === 0) throw httpError(404, "Supply request not found.");
-  const from = rows[0].status;
-  const allowed = {
-    submitted: ["under_review", "rejected"],
-    under_review: ["approved", "rejected"],
-    approved: ["processing", "rejected"],
-    processing: ["fulfillment_in_progress"],
-    fulfillment_in_progress: ["partially_fulfilled", "fulfilled"],
-    partially_fulfilled: ["fulfilled"],
-  };
-  if (!(allowed[from] ?? []).includes(status)) {
-    throw httpError(409, `Allowed transition from "${REQUEST_STATUS_LABEL[from]}" is ${allowed[from] ?? []}.`);
-  }
-  await pool.query("UPDATE supply_requests SET status = ?, updated_at = NOW() WHERE id = ?", [status, id]);
-  return { ok: true };
-}
-
 export async function fetchDashboard(user) {
   const vendorId = vendorIdOf(user);
   const [suppliers, arrivals, receipts, notifications] = await Promise.all([

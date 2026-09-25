@@ -95,15 +95,18 @@ const TABLES = [
     INDEX idx_suppliers_vendor (vendor_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
-  `CREATE TABLE IF NOT EXISTS supplier_products (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    supplier_id VARCHAR(30) NOT NULL,
-    name VARCHAR(180) NOT NULL,
-    description VARCHAR(500) NOT NULL DEFAULT '',
-    brand VARCHAR(160) NOT NULL DEFAULT '',
-    category VARCHAR(60) NOT NULL DEFAULT '',
-    CONSTRAINT fk_sp_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers (id) ON DELETE CASCADE
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+   `CREATE TABLE IF NOT EXISTS supplier_products (
+     id INT AUTO_INCREMENT PRIMARY KEY,
+     supplier_id VARCHAR(30) NOT NULL,
+     name VARCHAR(180) NOT NULL,
+     description VARCHAR(500) NOT NULL DEFAULT '',
+     brand VARCHAR(160) NOT NULL DEFAULT '',
+     category VARCHAR(60) NOT NULL DEFAULT '',
+     sku VARCHAR(60) NOT NULL DEFAULT '',
+     stock INT NOT NULL DEFAULT 0,
+     unit VARCHAR(20) NOT NULL DEFAULT 'pcs',
+     CONSTRAINT fk_sp_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers (id) ON DELETE CASCADE
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
   `CREATE TABLE IF NOT EXISTS arrivals (
     id VARCHAR(40) NOT NULL PRIMARY KEY,

@@ -8,45 +8,47 @@ import { config } from "../config.js";
 import { generateReceivingReport, verifyReceivingReportPassword } from "../receiving-report.js";
 import { vendorIdOf } from "../store.js";
 import {
-  approveApplication,
-  cancelSupplyRequest,
-  clearNotifications,
-  createSupplyRequest,
-  createVendorReceiving,
-  deleteCompanyDocument,
-  fetchApplicationById,
-  fetchApplicationDocument,
-  fetchApplications,
-  fetchAuditLogs,
-  fetchBootstrap,
-  fetchCompanyDocument,
-  fetchCompanyProfile,
-  fetchDashboard,
-  fetchDeliveryDocument,
-  fetchEvaluations,
-  fetchPerformance,
-  fetchReceiptById,
-  fetchReceiptHistory,
-  fetchSupplierById,
-  fetchSupplyRequestById,
-  fetchSupplyRequests,
-  fetchVendorReceivingById,
-  insertCompanyDocument,
-  insertDeliveryDocument,
-  listCompanyDocuments,
-  listDeliveryDocuments,
-  listVendorReceivings,
-  markAllNotificationsRead,
-  markNotificationRead,
-  rejectApplication,
-  requestApplicationRevision,
-  saveEvaluation,
-  setApplicationUnderReview,
-  setSupplierStatus,
-  submitSupplyRequest,
-  updateCompanyProfile,
-  updateSupplyRequest,
-} from "../store.js";
+   approveApplication,
+   cancelSupplyRequest,
+   clearNotifications,
+   createSupplyRequest,
+   createVendorReceiving,
+   deleteCompanyDocument,
+   fetchApplicationById,
+   fetchApplicationDocument,
+   fetchApplications,
+   fetchAuditLogs,
+   fetchBootstrap,
+   fetchCompanyDocument,
+   fetchCompanyProfile,
+   fetchDashboard,
+   fetchDeliveryDocument,
+   fetchEvaluations,
+   fetchPerformance,
+   fetchReceiptById,
+   fetchReceiptHistory,
+   fetchSupplierById,
+   fetchSupplyRequestById,
+   fetchSupplyRequests,
+   fetchSupplyRequestStatusCounts,
+   fetchVendorReceivingById,
+   fetchVendorReceivingHistory,
+   insertCompanyDocument,
+   insertDeliveryDocument,
+   listCompanyDocuments,
+   listDeliveryDocuments,
+   listVendorReceivings,
+   markAllNotificationsRead,
+   markNotificationRead,
+   rejectApplication,
+   requestApplicationRevision,
+   saveEvaluation,
+   setApplicationUnderReview,
+   setSupplierStatus,
+   submitSupplyRequest,
+   updateCompanyProfile,
+   updateSupplyRequest,
+ } from "../store.js";
 
 /* Resolve the authenticated principal (auth.js requireVendor) and expose it
    with the request IP for audit logging. */
@@ -148,6 +150,19 @@ router.get(
   })
 );
 
+router.get(
+  "/receiving/vendor-history",
+  asyncHandler(async (req, res) => {
+    const from = typeof req.query.from === "string" && req.query.from.trim() ? req.query.from.trim() : undefined;
+    const to = typeof req.query.to === "string" && req.query.to.trim() ? req.query.to.trim() : undefined;
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    if (from && !re.test(from)) throw httpError(400, "Invalid From date. Use the format YYYY-MM-DD.");
+    if (to && !re.test(to)) throw httpError(400, "Invalid To date. Use the format YYYY-MM-DD.");
+    if (from && to && from > to) throw httpError(400, "The From date cannot be later than the To date.");
+    res.json(await fetchVendorReceivingHistory(actor(req), { fromDate: from, toDate: to }));
+  })
+);
+
 /* Receiving Auto Report (PDF) — password-verified, staff-scoped.
    Step 1: the user proves their own account password (backend bcrypt check).
    Step 2: uses the short-lived grant from step 1 to generate the PDF. */
@@ -211,6 +226,14 @@ router.delete(
   "/notifications/clear",
   asyncHandler(async (req, res) => {
     res.json(await clearNotifications(actor(req)));
+  })
+);
+
+router.get(
+  "/supply-requests/counts",
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    res.json(await fetchSupplyRequestStatusCounts(req.user.vendorId));
   })
 );
 

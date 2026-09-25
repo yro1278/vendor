@@ -106,34 +106,49 @@ export async function generateReceivingReport({ user, grant, from, to, ip = "" }
   if (from !== undefined && from !== "" && !DATE_RE.test(from)) throw httpError(400, "Invalid From date.");
   if (to !== undefined && to !== "" && !DATE_RE.test(to)) throw httpError(400, "Invalid To date.");
 
-  const where = ["vendor_id = ?"];
+  const where = ["vr.vendor_id = ?"];
   const params = [vendorId];
   if (from) {
-    where.push("received_at >= ?");
+    where.push("vr.received_at >= ?");
     params.push(`${from} 00:00:00`);
   }
   if (to) {
-    where.push("received_at < DATE_ADD(?, INTERVAL 1 DAY)");
+    where.push("vr.received_at < DATE_ADD(?, INTERVAL 1 DAY)");
     params.push(to);
   }
 
-  const [receipts] = await pool.query(
-    `SELECT id, arrival_id, supplier_id, supplier_name, status, total_qty, received_at, receiving_by, doc_ref, remarks
-     FROM receipts WHERE ${where.join(" AND ")} ORDER BY received_at DESC`,
+  const [vrRows] = await pool.query(
+    `SELECT vr.*, a.supplier_id AS a_supplier_id, a.supplier_name AS a_supplier_name, a.source_ref
+     FROM vendor_receivings vr
+     JOIN arrivals a ON a.id = vr.arrival_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY vr.received_at DESC`,
     params
   );
-  if (receipts.length === 0) {
+  if (vrRows.length === 0) {
     throw httpError(400, "No receiving records found for the selected date range.");
   }
 
-  const ids = receipts.map((r) => r.id);
-  const placeholders = ids.map(() => "?").join(",");
-  const [items] = await pool.query(
-    `SELECT receipt_id, product_name, qty, unit, condition_value FROM receipt_items WHERE receipt_id IN (${placeholders}) ORDER BY id`,
-    ids
+  const vrIds = vrRows.map((r) => r.id);
+  const placeholders = vrIds.map(() => "?").join(",");
+  const [vriRows] = await pool.query(
+    `SELECT receiving_id, product_name, qty, unit FROM vendor_receiving_items WHERE receiving_id IN (${placeholders}) ORDER BY id`,
+    vrIds
   );
 
-  const arrivalIds = [...new Set(receipts.map((r) => r.arrival_id).filter(Boolean))];
+  /* Get inspection condition data from receipts linked to the same arrivals */
+  const arrivalIds = [...new Set(vrRows.map((r) => r.arrival_id))];
+   const [inspectionRows] = await pool.query(
+    arrivalIds.length > 0 ? `
+      SELECT r.arrival_id, ri.product_name, ri.unit, ri.condition_value, COALESCE(SUM(ri.qty), 0) AS qty
+      FROM receipt_items ri
+      JOIN receipts r ON r.id = ri.receipt_id
+      WHERE r.arrival_id IN (${arrivalIds.map(() => "?").join(",")})
+      GROUP BY r.arrival_id, ri.product_name, ri.unit, ri.condition_value
+      HAVING SUM(ri.qty) > 0` : "SELECT 1 AS dummy WHERE 0=1",
+    arrivalIds.length > 0 ? arrivalIds : []
+  );
+
   const expectedByArrival = new Map();
   if (arrivalIds.length > 0) {
     const arrPlaceholders = arrivalIds.map(() => "?").join(",");
@@ -144,37 +159,65 @@ export async function generateReceivingReport({ user, grant, from, to, ip = "" }
     for (const a of arrivals) expectedByArrival.set(a.id, Number(a.total_qty));
   }
 
-  const itemsByReceipt = new Map();
-  for (const it of items) {
-    if (!itemsByReceipt.has(it.receipt_id)) itemsByReceipt.set(it.receipt_id, []);
-    itemsByReceipt.get(it.receipt_id).push(it);
+  const conditionMap = new Map();
+  for (const row of inspectionRows) {
+    const key = `${row.arrival_id}::${row.product_name}::${row.unit}`;
+    if (!conditionMap.has(key)) conditionMap.set(key, {});
+    conditionMap.get(key)[row.condition_value] = Number(row.qty);
+  }
+
+  const itemsByReceiving = new Map();
+  for (const it of vriRows) {
+    if (!itemsByReceiving.has(it.receiving_id)) itemsByReceiving.set(it.receiving_id, []);
+    itemsByReceiving.get(it.receiving_id).push(it);
+  }
+
+  const supplierMap = new Map();
+  const uniqueSuppliers = [...new Set(vrRows.map((r) => r.a_supplier_id))];
+  if (uniqueSuppliers.length > 0) {
+    const [suppRows] = await pool.query(
+      `SELECT id, company_name FROM suppliers WHERE id IN (${uniqueSuppliers.map(() => "?").join(",")})`,
+      uniqueSuppliers
+    );
+    for (const s of supRows) supplierMap.set(s.id, s.company_name);
   }
 
   let sumExpected = 0;
   let sumReceived = 0;
   let sumGood = 0;
   let sumDamaged = 0;
-  const rows = receipts.map((r) => {
-    const its = itemsByReceipt.get(r.id) ?? [];
-    const good = its.filter((i) => i.condition_value === "good").reduce((a, i) => a + Number(i.qty), 0);
-    const damaged = its.filter((i) => i.condition_value !== "good").reduce((a, i) => a + Number(i.qty), 0);
+  const rows = vrRows.map((r) => {
+    const its = itemsByReceiving.get(r.id) ?? [];
+    const supplierName = supplierMap.get(r.a_supplier_id) ?? r.a_supplier_name ?? "";
+    const good = its.reduce((a, i) => {
+      const conds = conditionMap.get(`${r.arrival_id}::${i.product_name}::${i.unit}`) ?? {};
+      return a + (conds.good ?? 0);
+    }, 0);
+    const damaged = its.reduce((a, i) => {
+      const conds = conditionMap.get(`${r.arrival_id}::${i.product_name}::${i.unit}`) ?? {};
+      return a + ((conds.damaged ?? 0) + (conds.rejected ?? 0));
+    }, 0);
     const expected = r.arrival_id && expectedByArrival.has(r.arrival_id) ? Number(expectedByArrival.get(r.arrival_id)) : null;
-    sumReceived += Number(r.total_qty);
+    sumReceived += Number(its.reduce((a, i) => a + Number(i.qty), 0));
     sumGood += good;
     sumDamaged += damaged;
     if (expected != null) sumExpected += expected;
     return {
       id: r.id,
-      docRef: r.doc_ref ?? "",
-      supplier: r.supplier_name,
-      items: its.map((i) => `${i.product_name} (${fmt(i.qty)} ${i.unit}${i.condition_value === "good" ? "" : ` · ${i.condition_value}`})`).join("\n") || "—",
+      docRef: r.id,
+      supplier: supplierName,
+      items: its.map((i) => {
+        const conds = conditionMap.get(`${r.arrival_id}::${i.product_name}::${i.unit}`) ?? {};
+        const hasIssue = (conds.damaged ?? 0) + (conds.rejected ?? 0) > 0;
+        return `${i.product_name} (${fmt(i.qty)} ${i.unit}${hasIssue ? ` · damaged` : ""})`;
+      }).join("\n") || "—",
       expected,
-      received: Number(r.total_qty),
+      received: its.reduce((a, i) => a + Number(i.qty), 0),
       good,
       damaged,
       receivedAt: fmtDateTime(r.received_at),
       status: damaged > 0 ? RECEIPT_HAS_ISSUE_TEXT : "Received",
-      receivedBy: r.receiving_by,
+      receivedBy: r.received_by,
       remarks: (r.remarks ?? "").trim() || "—",
     };
   });
