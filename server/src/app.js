@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import authRouter from "./routes/auth.js";
+import publicRouter from "./routes/public.js";
 import vendorRouter from "./routes/vendor.js";
 import { requireAuth, requireVendor } from "./auth.js";
 
@@ -12,6 +13,9 @@ app.use(express.json());
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
+
+/* Unauthenticated supplier-sourcing endpoints (apply + status lookup). */
+app.use("/api/public", publicRouter);
 
 app.use("/api/auth", authRouter);
 app.use("/api/vendor", requireAuth, requireVendor, vendorRouter);

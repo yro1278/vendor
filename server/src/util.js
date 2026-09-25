@@ -180,3 +180,55 @@ export function mapSupplyRequest(row, items = [], fulfillment = { items: [], pro
     updatedAt: toIso(row.updated_at),
   };
 }
+
+export function mapApplication(row, extra = {}) {
+  return {
+    id: row.id,
+    companyName: row.company_name,
+    businessRegNo: row.business_reg_no,
+    tin: row.tin,
+    address: row.address,
+    email: row.email,
+    phone: row.phone,
+    website: row.website ?? "",
+    distributionArea: row.distribution_area ?? "",
+    contactName: row.contact_name,
+    contactPosition: row.contact_position,
+    supplierType: row.supplier_type,
+    yearsInBusiness: row.years_in_business ?? null,
+    status: row.status,
+    approvedSupplierId: row.approved_supplier_id ?? "",
+    revisionNote: row.revision_note ?? "",
+    rejectionReason: row.rejection_reason ?? "",
+    submittedAt: toIso(row.submitted_at),
+    updatedAt: toIso(row.updated_at),
+    products: extra.products ?? [],
+    documents: extra.documents ?? [],
+    timeline: extra.timeline ?? [],
+  };
+}
+
+export function mapEvaluation(row, criteria = []) {
+  const total = criteria.reduce((a, c) => a + (c.weight * c.score) / 100, 0);
+  return {
+    id: row.id,
+    supplierId: row.supplier_id,
+    supplierName: row.supplier_name ?? "",
+    comment: row.comment ?? "",
+    scores: criteria.reduce((acc, c) => { acc[c.criterion] = c.score; return acc; }, {}),
+    total: Math.round(total * 100) / 100,
+    createdAt: toIso(row.created_at),
+  };
+}
+
+export function mapAuditLog(row) {
+  return {
+    id: row.id,
+    action: row.action,
+    entity: row.entity_type,
+    entityId: row.entity_id,
+    actor: row.actor_name || (row.user_id != null ? `User #${row.user_id}` : "System"),
+    details: row.detail ?? "",
+    timestamp: toIso(row.created_at),
+  };
+}

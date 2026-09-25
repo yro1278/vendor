@@ -11,6 +11,31 @@ import { createSession, requireAuth, revokeSession } from "../auth.js";
 
 const router = Router();
 
+/* Returns the authenticated user's current identity — including role —
+   so the frontend can re-sync its role-based navigation on reload without
+   trusting anything stored in the browser. */
+router.get(
+  "/me",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const [rows] = await pool.query(
+      "SELECT id, username, display_name, role, vendor_id FROM users WHERE id = ?",
+      [req.tokenPayload.sub]
+    );
+    if (rows.length === 0) throw httpError(401, "Unauthorized.");
+    const u = rows[0];
+    res.json({
+      user: {
+        id: u.id,
+        username: u.username,
+        displayName: u.display_name,
+        role: u.role,
+        vendorId: u.vendor_id,
+      },
+    });
+  })
+);
+
 router.post(
   "/login",
   asyncHandler(async (req, res) => {

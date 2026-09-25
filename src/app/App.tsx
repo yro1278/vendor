@@ -1,30 +1,55 @@
 import VendorManagement, { VendorLogin } from "./VendorModule";
-import { useAdminSession, useVendorData } from "./vendor-data";
-import { api, clearToken, getToken, setUnauthorizedHandler } from "./api";
-import { useEffect } from "react";
+import { useSessionRole, useVendorData } from "./vendor-data";
+import { api, ApiError, clearToken, getToken, setSessionUser, setUnauthorizedHandler } from "./api";
+import { useEffect, useState } from "react";
 
 export default function App() {
   const { data, actions, loading, error, sessionExpired, refresh } = useVendorData();
-  const [isAdmin, setAdmin] = useAdminSession();
+  const [role, setRole] = useSessionRole();
+  const [idleNotice, setIdleNotice] = useState(false);
 
   useEffect(() => {
-    setUnauthorizedHandler(() => setAdmin(false));
+    setUnauthorizedHandler(() => setRole(null));
     return () => setUnauthorizedHandler(null);
-  }, [setAdmin]);
+  }, [setRole]);
 
   useEffect(() => {
     if (sessionExpired) {
       clearToken();
-      setAdmin(false);
+      setRole(null);
     }
-  }, [sessionExpired, setAdmin]);
+  }, [sessionExpired, setRole]);
 
-  if (!isAdmin) {
+  /* Re-sync the role from the server on reload so stale browser storage can
+     never widen the authenticated scope. */
+  useEffect(() => {
+    if (!role || !getToken()) return;
+    let cancelled = false;
+    api.me()
+      .then((res) => {
+        if (cancelled) return;
+        setRole(res.user.role);
+        setSessionUser(res.user);
+      })
+      .catch((err) => {
+        if (!cancelled && err instanceof ApiError && err.status !== 0) setRole(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [role, setRole]);
+
+  if (!role) {
     return (
       <VendorLogin
-        notice={sessionExpired ? "Your session expired or is no longer valid. Please sign in again." : undefined}
-        onLogin={() => {
-          setAdmin(true);
+        notice={idleNotice
+          ? "Your session has expired due to inactivity. Please log in again."
+          : sessionExpired
+            ? "Your session expired or is no longer valid. Please sign in again."
+            : undefined}
+        onLogin={(newRole) => {
+          setIdleNotice(false);
+          setRole(newRole);
           void refresh();
         }}
       />
@@ -33,15 +58,17 @@ export default function App() {
 
   return (
     <VendorManagement
+      role={role}
       data={data}
       actions={actions}
       loading={loading}
       error={error}
       onLogout={() => {
-        setAdmin(false);
+        setRole(null);
         if (getToken()) void api.logout().catch(() => undefined);
         clearToken();
       }}
+      onSessionExpired={() => setIdleNotice(true)}
     />
   );
 }

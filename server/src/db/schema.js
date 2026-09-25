@@ -34,22 +34,6 @@ const TABLES = [
     INDEX idx_revoked_expiry (expires_at)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
-  /* Server-side inactivity tracking for Vendor Management sessions.
-     A session is created at login and its sliding window (30 minutes)
-     is bumped on every protected vendor request; once the window lapses
-     the token is revoked and further access is denied with 401. */
-  `CREATE TABLE IF NOT EXISTS sessions (
-    jti VARCHAR(64) NOT NULL PRIMARY KEY,
-    user_id INT NULL,
-    vendor_id VARCHAR(40) NULL,
-    last_seen DATETIME NOT NULL,
-    expires_at DATETIME NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_sessions_user (user_id),
-    INDEX idx_sessions_expiry (expires_at),
-    CONSTRAINT fk_session_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-
   `CREATE TABLE IF NOT EXISTS company_documents (
     id VARCHAR(64) NOT NULL PRIMARY KEY,
     vendor_id VARCHAR(40) NOT NULL,
@@ -72,6 +56,22 @@ const TABLES = [
     vendor_id VARCHAR(40) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_users_vendor (vendor_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  /* Server-side inactivity tracking for Vendor Management sessions.
+     A session is created at login and its sliding window (30 minutes)
+     is bumped on every protected vendor request; once the window lapses
+     the token is revoked and further access is denied with 401. */
+  `CREATE TABLE IF NOT EXISTS sessions (
+    jti VARCHAR(64) NOT NULL PRIMARY KEY,
+    user_id INT NULL,
+    vendor_id VARCHAR(40) NULL,
+    last_seen DATETIME NOT NULL,
+    expires_at DATETIME NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_sessions_user (user_id),
+    INDEX idx_sessions_expiry (expires_at),
+    CONSTRAINT fk_session_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
   `CREATE TABLE IF NOT EXISTS suppliers (
@@ -175,9 +175,11 @@ const TABLES = [
     type VARCHAR(20) NOT NULL DEFAULT 'info',
     is_read TINYINT(1) NOT NULL DEFAULT 0,
     vendor_id VARCHAR(40) NOT NULL DEFAULT '',
+    recipient VARCHAR(20) NOT NULL DEFAULT 'all',
     created_at DATETIME NOT NULL,
     INDEX idx_notifications_read (is_read),
-    INDEX idx_notifications_vendor (vendor_id)
+    INDEX idx_notifications_vendor (vendor_id),
+    INDEX idx_notifications_recipient (recipient)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
   `CREATE TABLE IF NOT EXISTS supply_requests (
@@ -220,6 +222,97 @@ const TABLES = [
     CONSTRAINT fk_sri_request FOREIGN KEY (request_id) REFERENCES supply_requests (id) ON DELETE CASCADE,
     CONSTRAINT fk_sri_product FOREIGN KEY (product_id) REFERENCES supplier_products (id) ON DELETE SET NULL,
     CONSTRAINT chk_sri_qty CHECK (quantity > 0)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  /* Public supplier applications drive the sourcing workflow: applicants
+     submit through the public portal, Tri-M staff review and approve,
+     and approval materializes a real suppliers row. */
+  `CREATE TABLE IF NOT EXISTS supplier_applications (
+    id VARCHAR(40) NOT NULL PRIMARY KEY,
+    vendor_id VARCHAR(40) NOT NULL DEFAULT '',
+    company_name VARCHAR(180) NOT NULL,
+    business_reg_no VARCHAR(80) NOT NULL DEFAULT '',
+    tin VARCHAR(60) NOT NULL DEFAULT '',
+    address VARCHAR(255) NOT NULL DEFAULT '',
+    email VARCHAR(160) NOT NULL DEFAULT '',
+    phone VARCHAR(60) NOT NULL DEFAULT '',
+    website VARCHAR(160) NOT NULL DEFAULT '',
+    distribution_area VARCHAR(255) NOT NULL DEFAULT '',
+    contact_name VARCHAR(120) NOT NULL DEFAULT '',
+    contact_position VARCHAR(120) NOT NULL DEFAULT '',
+    supplier_type VARCHAR(30) NOT NULL DEFAULT 'Other',
+    years_in_business INT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'pending_review',
+    approved_supplier_id VARCHAR(30) NULL,
+    revision_note VARCHAR(1000) NOT NULL DEFAULT '',
+    rejection_reason VARCHAR(1000) NOT NULL DEFAULT '',
+    submitted_at DATETIME NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_apply_status (status),
+    INDEX idx_apply_email (email),
+    INDEX idx_apply_vendor (vendor_id),
+    CONSTRAINT fk_apply_vendor FOREIGN KEY (vendor_id) REFERENCES vendors (id) ON DELETE CASCADE,
+    CONSTRAINT fk_apply_supplier FOREIGN KEY (approved_supplier_id) REFERENCES suppliers (id) ON DELETE SET NULL
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS application_products (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    application_id VARCHAR(40) NOT NULL,
+    name VARCHAR(180) NOT NULL,
+    category VARCHAR(60) NOT NULL DEFAULT '',
+    description VARCHAR(500) NOT NULL DEFAULT '',
+    brand VARCHAR(160) NOT NULL DEFAULT '',
+    supply_capacity VARCHAR(120) NOT NULL DEFAULT '',
+    min_order_qty VARCHAR(120) NOT NULL DEFAULT '',
+    price_range VARCHAR(120) NOT NULL DEFAULT '',
+    unit VARCHAR(20) NOT NULL DEFAULT '',
+    CONSTRAINT fk_ap_application FOREIGN KEY (application_id) REFERENCES supplier_applications (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS application_documents (
+    id VARCHAR(64) NOT NULL PRIMARY KEY,
+    application_id VARCHAR(40) NOT NULL,
+    original_name VARCHAR(255) NOT NULL,
+    stored_name VARCHAR(255) NOT NULL,
+    mime_type VARCHAR(120) NOT NULL,
+    size_bytes INT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_ad_application (application_id),
+    CONSTRAINT fk_ad_application FOREIGN KEY (application_id) REFERENCES supplier_applications (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS application_timeline (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    application_id VARCHAR(40) NOT NULL,
+    action VARCHAR(120) NOT NULL,
+    actor VARCHAR(100) NOT NULL DEFAULT '',
+    note VARCHAR(1000) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL,
+    INDEX idx_at_application (application_id),
+    CONSTRAINT fk_at_application FOREIGN KEY (application_id) REFERENCES supplier_applications (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  /* Periodic admin evaluations of an approved supplier. Criteria scores live
+     in evaluation_criteria; the weighted total is written back to suppliers. */
+  `CREATE TABLE IF NOT EXISTS evaluations (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    supplier_id VARCHAR(30) NOT NULL,
+    evaluator_id INT NULL,
+    comment VARCHAR(1000) NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_eval_supplier (supplier_id),
+    CONSTRAINT fk_eval_supplier FOREIGN KEY (supplier_id) REFERENCES suppliers (id) ON DELETE CASCADE,
+    CONSTRAINT fk_eval_user FOREIGN KEY (evaluator_id) REFERENCES users (id) ON DELETE SET NULL
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS evaluation_criteria (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    evaluation_id INT NOT NULL,
+    criterion VARCHAR(40) NOT NULL,
+    label VARCHAR(120) NOT NULL,
+    weight INT NOT NULL,
+    score INT NOT NULL,
+    CONSTRAINT fk_ec_evaluation FOREIGN KEY (evaluation_id) REFERENCES evaluations (id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 ];
 

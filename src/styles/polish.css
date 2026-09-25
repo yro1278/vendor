@@ -37,6 +37,10 @@
   .drawer-backdrop { animation: triM-fade-in .2s ease both; }
   .drawer-panel    { animation: triM-drawer-in .28s cubic-bezier(.16,1,.3,1) both; }
 
+  /* Notification bell dropdown — quick fade + slide down on open, fade + slide up on close */
+  .notif-in  { animation: triM-notif-in  .2s cubic-bezier(.16,1,.3,1) both; }
+  .notif-out { animation: triM-notif-out .16s ease-in both; }
+
   /* Anchor offset so sticky nav never hides section tops */
   .triM-section { scroll-margin-top: 84px; }
 }
@@ -45,6 +49,8 @@
 @keyframes triM-modal-in  { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: none; } }
 @keyframes triM-menu-in   { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
 @keyframes triM-drawer-in { from { transform: translateX(-100%); } to { transform: none; } }
+@keyframes triM-notif-in  { from { opacity: 0; transform: translateY(-8px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes triM-notif-out { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-5px) scale(.985); } }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

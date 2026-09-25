@@ -27,8 +27,15 @@ const MIGRATIONS = [
   `ALTER TABLE receipts ADD INDEX idx_receipts_vendor (vendor_id)`,
   `ALTER TABLE notifications ADD COLUMN vendor_id VARCHAR(40) NOT NULL DEFAULT '' AFTER is_read`,
   `ALTER TABLE notifications ADD INDEX idx_notifications_vendor (vendor_id)`,
+  `ALTER TABLE notifications ADD COLUMN recipient VARCHAR(20) NOT NULL DEFAULT 'all' AFTER vendor_id`,
+  `ALTER TABLE notifications ADD INDEX idx_notifications_recipient (recipient)`,
   `ALTER TABLE supply_requests ADD COLUMN vendor_id VARCHAR(40) NOT NULL DEFAULT '' AFTER expected_delivery_date`,
   `ALTER TABLE supply_requests ADD INDEX idx_req_vendor (vendor_id)`,
+  `ALTER TABLE suppliers ADD COLUMN evaluation_score DECIMAL(5,2) NULL AFTER status`,
+  `ALTER TABLE suppliers ADD COLUMN performance_rating DECIMAL(5,2) NULL AFTER evaluation_score`,
+  `ALTER TABLE suppliers ADD COLUMN last_evaluated DATETIME NULL AFTER performance_rating`,
+  `ALTER TABLE suppliers ADD COLUMN source_application_id VARCHAR(40) NULL AFTER source_ref`,
+  `UPDATE users SET role = 'receiving_staff' WHERE role = 'vendor'`,
 ];
 
 /*

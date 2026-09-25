@@ -1,5 +1,5 @@
 import { Dispatch, SetStateAction, useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, clearToken, CompanyProfile } from "./api";
+import { api, ApiError, clearToken } from "./api";
 
 /* ─────────────────────────────────────────────────────────
    TRI-M GLOBAL LOGISTICS & TRADING INC.
@@ -259,11 +259,22 @@ export const receiptHasIssue = (rec: SupplyReceipt) => rec.items.some(i => i.con
 export const supplierReceivedQty = (supplierId: string, receipts: SupplyReceipt[]) =>
   receipts.filter(r => r.supplierId === supplierId).reduce((a, r) => a + r.totalQty, 0);
 
-/* ── persistence (auth flag only — business data lives in MySQL) ── */
+/* ── roles ──────────────────────────────────────────────── */
 
-const LS_KEYS = {
-  adminSession: "trim_vendor_admin_session",
+/* Canonical role values must match the backend (server/src/db/constants.js). */
+export type SystemRole = "admin" | "receiving_staff";
+
+export const SYSTEM_ROLES: readonly SystemRole[] = ["admin", "receiving_staff"];
+
+export const ROLE_LABELS: Record<SystemRole, string> = {
+  admin: "Admin",
+  receiving_staff: "Receiving Staff",
 };
+
+export const isSystemRole = (r: string | null | undefined): r is SystemRole =>
+  !!r && (SYSTEM_ROLES as readonly string[]).includes(r);
+
+/* ── persistence (auth session only — business data lives in MySQL) ── */
 
 export function usePersisted<T>(key: string, seed: T): [T, Dispatch<SetStateAction<T>>] {
   const [state, setState] = useState<T>(() => {
@@ -284,9 +295,22 @@ export function usePersisted<T>(key: string, seed: T): [T, Dispatch<SetStateActi
   return [state, set];
 }
 
-export function useAdminSession(): [boolean, (v: boolean) => void] {
-  const [isAdmin, setRaw] = usePersisted<boolean>(LS_KEYS.adminSession, false);
-  return [isAdmin, setRaw];
+export function useSessionRole(): [string | null, (v: string | null) => void] {
+  const [role, setRole] = useState<string | null>(() => {
+    try {
+      const raw = localStorage.getItem("trim_vendor_role");
+      if (raw && isSystemRole(raw)) return raw;
+    } catch { /* ignore corrupt data */ }
+    return null;
+  });
+  const set = (v: string | null) => {
+    setRole(v);
+    try {
+      if (v && isSystemRole(v)) localStorage.setItem("trim_vendor_role", v);
+      else localStorage.removeItem("trim_vendor_role");
+    } catch { /* ignore quota */ }
+  };
+  return [role, set];
 }
 
 /* ── store + business actions ──────────────────────────── */
@@ -298,7 +322,6 @@ export interface VendorData {
   notifications: AppNotification[];
   supplyRequests: SupplyRequest[];
   products: Product[];        /* product master (existing supplier_products records) */
-  profile: CompanyProfile | null;  /* company profile from the vendors table */
 }
 
 export interface VendorActions {
@@ -312,6 +335,7 @@ export interface VendorActions {
   updateSupplyRequest: (id: string, input: SupplyRequestInput) => Promise<{ ok: boolean; id?: string; error?: string; errors?: Record<string, string> }>;
   submitSupplyRequest: (id: string) => Promise<{ ok: boolean; error?: string }>;
   cancelSupplyRequest: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  searchReceivingHistory: (from?: string, to?: string) => Promise<{ ok: true; rows: SupplyReceipt[] } | { ok: false; error: string }>;
 }
 
 /* For each distinct product+unit, the declared total received
@@ -346,13 +370,12 @@ export function useVendorData(): {
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [supplyRequests, setSupplyRequests] = useState<SupplyRequest[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
-  const [profile, setProfile] = useState<CompanyProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sessionExpired, setSessionExpired] = useState(false);
 
-  const settersRef = useRef({ setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts, setProfile });
-  settersRef.current = { setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts, setProfile };
+  const settersRef = useRef({ setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts });
+  settersRef.current = { setSuppliers, setArrivals, setReceipts, setNotifications, setSupplyRequests, setProducts };
 
   const refresh = useCallback(async () => {
     setSessionExpired(false);
@@ -365,8 +388,6 @@ export function useVendorData(): {
       s.setNotifications(boot.notifications);
       s.setSupplyRequests(boot.supplyRequests);
       s.setProducts(boot.products);
-      const profile = await api.getCompanyProfile();
-      s.setProfile(profile);
       setError(null);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
@@ -469,8 +490,16 @@ export function useVendorData(): {
     }
   };
 
+  const searchReceivingHistory: VendorActions["searchReceivingHistory"] = async (from, to) => {
+    try {
+      return { ok: true, rows: await api.receivingHistory({ from, to }) };
+    } catch (e) {
+      return { ok: false, error: requestResult(e, "Failed to filter receiving history.").error };
+    }
+  };
+
   return {
-    data: { suppliers, arrivals, receipts, notifications, supplyRequests, products, profile },
+    data: { suppliers, arrivals, receipts, notifications, supplyRequests, products },
     loading,
     error,
     sessionExpired,
@@ -483,6 +512,7 @@ export function useVendorData(): {
       updateSupplyRequest,
       submitSupplyRequest,
       cancelSupplyRequest,
+      searchReceivingHistory,
       markNotifRead: (id) => {
         setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
         void sync(() => api.markNotifRead(id));

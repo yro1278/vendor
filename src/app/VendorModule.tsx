@@ -1,11 +1,11 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import {
-  LayoutDashboard, PackagePlus, PackageSearch, PackageCheck, Building2, Building, Bell,
-  LogOut, Menu, X, Eye, Search, ChevronDown, ChevronLeft, ChevronRight, Plus, Save, Trash2,
+  LayoutDashboard, PackagePlus, PackageSearch, PackageCheck, Building2, Bell,
+  LogOut, Menu, X, Eye, EyeOff, FileDown, Search, ChevronDown, ChevronLeft, ChevronRight, Plus, Save, Trash2,
   Clock, Truck, Boxes, ClipboardList, AlertTriangle, AlertCircle, Info, RefreshCw, Lock,
-  CheckCircle2, CheckCircle, XCircle, PackageOpen, Users, Mail, Phone, MapPin, FileText, ArrowLeft,
-  ClipboardPlus, Send, CalendarClock,
+  CheckCircle2, CheckCircle, XCircle, PackageOpen, Users, Mail, Phone, MapPin, FileText,
+  ClipboardPlus, Send, CalendarClock, ArrowDownUp,
 } from "lucide-react";
 import {
   Supplier, SupplyReceipt, ReceiptItem, ReceiptCondition, SupplyStatus, AppNotification,
@@ -14,8 +14,9 @@ import {
   supplierReceivedQty, VendorData, VendorActions,
   RequestPriority, SupplyRequest, SupplyRequestStatus, SupplyRequestInput,
   REQUEST_PRIORITIES, REQUEST_PRIORITY_LABEL, REQUEST_STATUS_CFG,
+  ROLE_LABELS, SystemRole,
 } from "./vendor-data";
-import { api, ApiError, setToken, type CompanyProfile } from "./api";
+import { api, ApiError, getSessionUser, setSessionUser, setToken } from "./api";
 import { usePagePersistence, useDraftPersistence, saveDraft, clearDraft, DraftType } from "./draft-persistence";
 
 /* ─────────────────────────────────────────────────────────
@@ -25,7 +26,16 @@ import { usePagePersistence, useDraftPersistence, saveDraft, clearDraft, DraftTy
    subsystem. No supplier recruiting / sourcing happens here.
    ───────────────────────────────────────────────────────── */
 
-type Page = "dashboard" | "receiving" | "monitor" | "request" | "suppliers" | "history" | "notifications" | "company";
+type Page = "dashboard" | "receiving" | "monitor" | "request" | "suppliers" | "history";
+
+type ReceivingPreset = { arrivalStatus: "expected" | "for_receiving" | "partially_received" };
+type HistoryPreset = { arrivalStatus?: SupplyStatus; issuesOnly?: boolean; from?: string; to?: string };
+
+const RECEIVE_PRESET_LABEL: Record<ReceivingPreset["arrivalStatus"], string> = {
+  expected: "Expected Deliveries",
+  for_receiving: "For Receiving",
+  partially_received: "Partially Received",
+};
 
 const inp = "w-full min-h-[44px] px-3.5 py-2.5 text-[15px] sm:text-sm border border-slate-200 rounded-xl bg-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#5b21b6]/20 focus:border-[#5b21b6]/40 transition-colors";
 const selectCls = `${inp} cursor-pointer appearance-none`;
@@ -108,8 +118,8 @@ const FulfillmentTag = ({ progress }: { progress: SupplyRequest["fulfillment"]["
       ? <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-full border bg-orange-50 text-orange-700 border-orange-200"><RefreshCw size={11} /> Partial</span>
       : <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-full border bg-slate-50 text-slate-500 border-slate-200">Pending</span>;
 
-const KpiCard = ({ icon, label, value, sub, color }: { icon: React.ReactNode; label: string; value: React.ReactNode; sub?: string; color: string }) => (
-  <Card className="p-5 card-hover">
+const KpiCard = ({ icon, label, value, sub, color, onClick }: { icon: React.ReactNode; label: string; value: React.ReactNode; sub?: string; color: string; onClick?: () => void }) => {
+  const inner = (
     <div className="flex items-center justify-between gap-3">
       <div className="min-w-0">
         <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide truncate">{label}</p>
@@ -118,8 +128,14 @@ const KpiCard = ({ icon, label, value, sub, color }: { icon: React.ReactNode; la
       </div>
       <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${color}`}>{icon}</div>
     </div>
-  </Card>
-);
+  );
+  if (!onClick) return <Card className="p-5 card-hover">{inner}</Card>;
+  return (
+    <button type="button" onClick={onClick} title={label} aria-label={label} className="text-left w-full rounded-2xl cursor-pointer transition focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400">
+      <Card className="p-5 card-hover hover:shadow-md">{inner}</Card>
+    </button>
+  );
+};
 
 const ProgressBar = ({ received, total, bad }: { received: number; total: number; bad?: boolean }) => {
   const pct = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0;
@@ -156,9 +172,179 @@ const Modal = ({ open, onClose, title, children, footer, maxW = "max-w-[640px]" 
   );
 };
 
+const ReceiptDetailsModal = ({ rec, onClose }: { rec: SupplyReceipt | null; onClose: () => void }) => (
+  <Modal open={!!rec} onClose={onClose} title={rec ? `Receiving Transaction · ${rec.id}` : "Receiving"} maxW="max-w-[680px]"
+    footer={rec && <div className="flex justify-end"><Btn variant="secondary" size="sm" onClick={onClose}>Close</Btn></div>}>
+    {rec && (
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2"><MonoId id={rec.id} /><ReceiptStatusPill rec={rec} /></div>
+        {[
+          { k: "Supplier", v: `${rec.supplierName}`, i: <Building2 size={14} /> },
+          { k: "Expected Supply", v: rec.arrivalId || "Ad-hoc receiving (no linked schedule)", i: <PackageOpen size={14} /> },
+          { k: "Date Received", v: fmtDateTime(rec.receivedAt), i: <Clock size={14} /> },
+          { k: "Received By", v: rec.receivingBy, i: <Users size={14} /> },
+          { k: "Document / Reference", v: rec.docRef, i: <FileText size={14} /> },
+          { k: "Remarks", v: rec.remarks || "—", i: <Info size={14} /> },
+        ].map(r => (
+          <div key={r.k} className="flex gap-3 py-3 border-b border-slate-100 last:border-0">
+            <div className="text-slate-400 mt-0.5">{r.i}</div>
+            <div className="flex-1 grid grid-cols-1 sm:grid-cols-[150px_1fr] gap-1">
+              <p className="text-[11px] uppercase tracking-wide font-semibold text-slate-400">{r.k}</p>
+              <p className="text-sm text-slate-700 break-words">{r.v}</p>
+            </div>
+          </div>
+        ))}
+        <div>
+          <p className="text-sm font-bold text-slate-700 mb-2">Received Items</p>
+          <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
+            {rec.items.map((it, i) => (
+              <div key={i} className="flex items-center justify-between gap-2 px-4 py-2.5">
+                <span className="text-sm text-slate-700">{it.productName}</span>
+                <span className="flex items-center gap-2"><strong className="text-slate-800 text-sm">{it.qty.toLocaleString()} {it.unit}</strong><ConditionPill condition={it.condition} /></span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    )}
+  </Modal>
+);
+
+/* ── receiving auto report (PDF) password modal ─────────── */
+
+const openPdfInViewer = (pdfBase64: string, filename: string) => {
+  const bin = atob(pdfBase64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+  const win = window.open(url, "_blank");
+  if (!win) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+  window.setTimeout(() => URL.revokeObjectURL(url), 120000);
+};
+
+const ReportPasswordModal = ({ open, onClose, from, to }: {
+  open: boolean;
+  onClose: () => void;
+  from: string;
+  to: string;
+}) => {
+  const [password, setPassword] = React.useState("");
+  const [show, setShow] = React.useState(false);
+  const [phase, setPhase] = React.useState<"idle" | "verifying" | "generating">("idle");
+  const [error, setError] = React.useState("");
+  const busy = phase !== "idle";
+
+  const requestClose = () => { if (!busy) onClose(); };
+
+  const handleVerify = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (busy) return;
+    if (!password.trim()) {
+      setError("Password is required.");
+      return;
+    }
+    setError("");
+    setPhase("verifying");
+    try {
+      const v = await api.verifyReceivingReportPassword(password);
+      setPhase("generating");
+      const r = await api.generateReceivingReport(v.grant, {
+        from: from.trim() || undefined,
+        to: to.trim() || undefined,
+      });
+      setPassword("");
+      openPdfInViewer(r.pdfBase64, r.filename);
+      onClose();
+    } catch (err) {
+      setPhase("idle");
+      setError(err instanceof ApiError ? err.message : "Failed to generate the receiving report. Please try again.");
+    }
+  };
+
+  const btnLabel = phase === "verifying" ? "Verifying password…" : phase === "generating" ? "Generating report…" : "Verify & Generate";
+
+  return (
+    <Modal open={open} onClose={requestClose} title="Verify Password" maxW="max-w-sm"
+      footer={
+        <div className="flex flex-wrap justify-end gap-3">
+          <Btn variant="secondary" size="sm" onClick={requestClose} disabled={busy}>Cancel</Btn>
+          <Btn size="sm" type="submit" form="report-password-form" disabled={busy}>
+            <span className="inline-flex items-center gap-1.5">{busy ? <RefreshCw size={13} className="animate-spin" /> : <FileDown size={13} />}{btnLabel}</span>
+          </Btn>
+        </div>
+      }>
+      <div className="space-y-4">
+        <p className="text-sm text-slate-600">Enter your account password to generate the receiving report.</p>
+        {error && (
+          <div className="bg-red-50 border border-red-200 rounded-xl p-3 flex gap-2 text-xs text-red-600"><AlertCircle size={14} className="shrink-0 mt-0.5" />{error}</div>
+        )}
+        <form id="report-password-form" onSubmit={handleVerify} className="space-y-1">
+          <label className="flex flex-col gap-1.5">
+            <span className="text-sm font-semibold text-slate-700">Password</span>
+            <div className="relative">
+              <input
+                type={show ? "text" : "password"}
+                className={`${inp} pr-11`}
+                value={password}
+                onChange={e => { setPassword(e.target.value); setError(""); }}
+                placeholder="Enter your password"
+                autoComplete="current-password"
+                autoFocus
+                disabled={busy}
+              />
+              <button type="button" onClick={() => setShow(v => !v)} disabled={busy}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1.5 rounded-lg hover:bg-slate-100 transition-colors"
+                aria-label={show ? "Hide password" : "Show password"}>
+                {show ? <EyeOff size={17} /> : <Eye size={17} />}
+              </button>
+            </div>
+          </label>
+        </form>
+        <p className="text-[11px] text-slate-400 leading-relaxed">For security, your password is verified by the server against your own account only. It is never stored, logged, or exposed in the report.</p>
+      </div>
+    </Modal>
+  );
+};
+
+const LogoutConfirmModal = ({ open, onClose, onConfirm }: { open: boolean; onClose: () => void; onConfirm: () => void }) => (
+  <Modal open={open} onClose={onClose} title="Logout" maxW="max-w-sm"
+    footer={
+      <div className="flex flex-wrap justify-end gap-3">
+        <Btn variant="secondary" size="sm" onClick={onClose}>No</Btn>
+        <Btn size="sm" onClick={onConfirm}><LogOut size={13} /> Yes</Btn>
+      </div>
+    }>
+    <p className="text-sm text-slate-600 leading-relaxed">Are you sure you want to log out?</p>
+  </Modal>
+);
+
+const SessionWarnModal = ({ open, busy, error, onStay, onLogout }: { open: boolean; busy: boolean; error: string; onStay: () => void; onLogout: () => void }) => (
+  <Modal open={open} onClose={onLogout} title="Session Timeout" maxW="max-w-sm"
+    footer={
+      <div className="flex flex-wrap justify-end gap-3">
+        <Btn variant="secondary" size="sm" disabled={busy} onClick={onLogout}>Log Out</Btn>
+        <Btn size="sm" disabled={busy} onClick={onStay}>
+          {busy ? <span className="inline-block w-3.5 h-3.5 rounded-full border-2 border-violet-300 border-t-transparent animate-spin" /> : <Clock size={13} />}
+          Stay Logged In
+        </Btn>
+      </div>
+    }>
+    <p className="text-sm text-slate-600 leading-relaxed">Your session is about to expire.</p>
+    <p className="text-sm text-slate-500 mt-1 leading-relaxed">You will be logged out due to inactivity.</p>
+    {error && <p className="mt-3 text-xs text-red-600 leading-relaxed">{error}</p>}
+  </Modal>
+);
+
 /* ── sign in ───────────────────────────────────────────── */
 
-export const VendorLogin = ({ onLogin, notice }: { onLogin: () => void; notice?: string }) => {
+export const VendorLogin = ({ onLogin, notice }: { onLogin: (role: string) => void; notice?: string }) => {
   const [username, setUsername] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [error, setError] = React.useState("");
@@ -172,13 +358,14 @@ export const VendorLogin = ({ onLogin, notice }: { onLogin: () => void; notice?:
     try {
       const res = await api.login(username.trim(), password);
       setToken(res.token);
-      onLogin();
+      setSessionUser(res.user);
+      onLogin(res.user.role);
     } catch (err) {
       const offline = err instanceof ApiError && err.status === 0;
       if (offline) {
-        setError("Cannot reach the vendor server. Check that the MySQL backend is running.");
+        setError("Cannot reach the vendor server. Check your connection and try again.");
       } else {
-        setError("Invalid username or password. Try the demo credentials below.");
+        setError("Invalid username or password.");
       }
     } finally {
       setLoading(false);
@@ -197,7 +384,7 @@ export const VendorLogin = ({ onLogin, notice }: { onLogin: () => void; notice?:
         </div>
         <div className="surface !rounded-2xl p-7 shadow-2xl bg-white">
           <h2 className="text-lg font-bold text-slate-800">Sign In</h2>
-          <p className="text-xs text-slate-500 mb-6">Record and monitor supplies provided through the Supply Chain subsystem.</p>
+          <p className="text-xs text-slate-500 mb-6">Record and monitor supplies received by Tri-M.</p>
           <form onSubmit={handleLogin} className="space-y-4">
             <Field label="Username">
               <input className={inp} value={username} onChange={e => { setUsername(e.target.value); setError(""); }} placeholder="admin" autoComplete="username" />
@@ -211,10 +398,6 @@ export const VendorLogin = ({ onLogin, notice }: { onLogin: () => void; notice?:
               {loading ? <><RefreshCw size={15} className="animate-spin" /> Signing in…</> : <><Lock size={15} /> Sign In</>}
             </Btn>
           </form>
-          <div className="mt-4 p-3 bg-slate-50 rounded-xl border border-slate-100">
-            <p className="text-xs text-slate-500 font-medium mb-1">Demo credentials</p>
-            <p className="text-xs text-slate-600 font-mono">Username: <strong>admin</strong> · Password: <strong>admin123</strong></p>
-          </div>
         </div>
       </div>
     </div>
@@ -223,39 +406,161 @@ export const VendorLogin = ({ onLogin, notice }: { onLogin: () => void; notice?:
 
 /* ── shell ─────────────────────────────────────────────── */
 
-const NAV: { icon: React.ReactNode; label: string; page: Page }[] = [
-  { icon: <LayoutDashboard size={17} />, label: "Dashboard", page: "dashboard" },
-  { icon: <PackagePlus size={17} />, label: "Receiving", page: "receiving" },
-  { icon: <PackageSearch size={17} />, label: "Supply Monitoring", page: "monitor" },
-  { icon: <ClipboardPlus size={17} />, label: "Request Supply", page: "request" },
-  { icon: <Building2 size={17} />, label: "Suppliers", page: "suppliers" },
-  { icon: <ClipboardList size={17} />, label: "Receiving History", page: "history" },
-  { icon: <Bell size={17} />, label: "Notifications", page: "notifications" },
-  { icon: <Building size={17} />, label: "Company Profile", page: "company" },
+/* Role-based navigation. "receiving_staff" sees only receiving functions;
+   "admin" additionally gets supplier management, supply requests, and the
+   sourcing/evaluation/reporting pages. */
+const NAV: { icon: React.ReactNode; label: string; page: Page; roles: readonly SystemRole[] }[] = [
+  { icon: <LayoutDashboard size={17} />, label: "Dashboard", page: "dashboard", roles: ["admin", "receiving_staff"] },
+  { icon: <PackagePlus size={17} />, label: "Receiving", page: "receiving", roles: ["admin", "receiving_staff"] },
+  { icon: <PackageSearch size={17} />, label: "Supply Monitoring", page: "monitor", roles: ["admin", "receiving_staff"] },
+  { icon: <ClipboardPlus size={17} />, label: "Request Supply", page: "request", roles: ["admin"] },
+  { icon: <Building2 size={17} />, label: "Suppliers", page: "suppliers", roles: ["admin"] },
+  { icon: <ClipboardList size={17} />, label: "Receiving History", page: "history", roles: ["admin", "receiving_staff"] },
 ];
 
+/* Idle session timeout: the server (auth.js requireVendor) expires the session
+   after 30 minutes of inactivity and slides the window on every /api/vendor
+   request. The UI mirrors it — warn 5 minutes before (25 min), expire at 30 min. */
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const IDLE_WARN_MS = 25 * 60 * 1000;
+const IDLE_HEARTBEAT_MS = 5 * 60 * 1000;
+
 type Props = {
+  role: SystemRole;
   data: VendorData;
   actions: VendorActions;
   loading?: boolean;
   error?: string | null;
   onLogout: () => void;
+  onSessionExpired?: () => void;
 };
 
 export default function VendorManagement(props: Props) {
-  const { data, actions, loading = false, error = null, onLogout } = props;
+  const { role, data, actions, loading = false, error = null, onLogout } = props;
   const [page, setPage, pageLoaded] = usePagePersistence<Page>("dashboard");
   const [mobileOpen, setMobileOpen] = React.useState(false);
   const [collapsed, setCollapsed] = React.useState(false);
   const [receiptTarget, setReceiptTarget] = React.useState<string | null>(null);
+  const [receivingPreset, setReceivingPreset] = React.useState<ReceivingPreset | null>(null);
+  const [historyPreset, setHistoryPreset] = React.useState<HistoryPreset | null>(null);
+  const [notifOpen, setNotifOpen] = React.useState(false);
+  const [logoutConfirm, setLogoutConfirm] = React.useState(false);
+  const bellRef = React.useRef<HTMLButtonElement | null>(null);
 
+  /* ── Idle session timeout (mirrors the server-side sliding window) ──
+     The backend already expires the session after 30 minutes without any
+     /api/vendor request (auth.js requireVendor). This UI layer matches that
+     window: it warns 5 minutes before the timeout and, on "Stay Logged In",
+     calls the server so the real session (not just the local timer) extends. */
+  const [sessionWarnOpen, setSessionWarnOpen] = React.useState(false);
+  const [sessionWarnErr, setSessionWarnErr] = React.useState("");
+  const [sessionTouchBusy, setSessionTouchBusy] = React.useState(false);
+  const lastActivityRef = React.useRef(Date.now());
+  const lastTouchRef = React.useRef(0);
+  const warnedRef = React.useRef(false);
+
+  const expireSession = React.useCallback(() => {
+    setSessionWarnOpen(false);
+    props.onSessionExpired?.();
+    props.onLogout();
+  }, [props]);
+
+  const touchSession = React.useCallback(
+    async (force = false) => {
+      if (!force && Date.now() - lastTouchRef.current < IDLE_HEARTBEAT_MS) return;
+      lastTouchRef.current = Date.now();
+      try {
+        await api.touchSession();
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          expireSession();
+        }
+      }
+    },
+    [expireSession]
+  );
+
+  React.useEffect(() => {
+    const events = ["pointerdown", "keydown", "touchstart", "wheel"];
+    const onActivity = () => {
+      lastActivityRef.current = Date.now();
+      void touchSession();
+    };
+    for (const ev of events) window.addEventListener(ev, onActivity, { passive: true, capture: true });
+    return () => {
+      for (const ev of events) window.removeEventListener(ev, onActivity, { capture: true });
+    };
+  }, [touchSession]);
+
+  React.useEffect(() => {
+    const iv = window.setInterval(() => {
+      const idle = Date.now() - lastActivityRef.current;
+      if (idle >= IDLE_TIMEOUT_MS) {
+        expireSession();
+        return;
+      }
+      if (idle < IDLE_WARN_MS) {
+        warnedRef.current = false;
+        return;
+      }
+      if (!warnedRef.current) {
+        warnedRef.current = true;
+        setSessionWarnErr("");
+        setSessionWarnOpen(true);
+      }
+    }, 5_000);
+    return () => window.clearInterval(iv);
+  }, [expireSession]);
+
+  const handleStayLoggedIn = async () => {
+    setSessionTouchBusy(true);
+    setSessionWarnErr("");
+    try {
+      await api.touchSession();
+      lastActivityRef.current = Date.now();
+      lastTouchRef.current = Date.now();
+      warnedRef.current = false;
+      setSessionWarnOpen(false);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        expireSession();
+      } else {
+        setSessionWarnErr(
+          e instanceof ApiError && e.message ? e.message : "Could not refresh your session. Check your connection and retry."
+        );
+      }
+    } finally {
+      setSessionTouchBusy(false);
+    }
+  };
+
+  const toggleNotifs = () => setNotifOpen(o => !o);
+
+  const navItems = NAV.filter(n => n.roles.includes(role));
+  /* If the persisted/current page is outside this role's allowed set
+     (e.g. a role was downgraded), fall back to the dashboard — never render
+     an admin page for receiving staff. */
+  const currentPage: Page = NAV.some(n => n.page === page && n.roles.includes(role)) ? (page as Page) : "dashboard";
   const unread = data.notifications.filter(n => !n.read).length;
-  const currentLabel = NAV.find(n => n.page === page)?.label ?? "Dashboard";
+  const currentLabel = NAV.find(n => n.page === currentPage)?.label ?? "Dashboard";
   const toNext = (p: Page) => { setPage(p); window.scrollTo({ top: 0 }); };
 
   const startReceiving = (arrivalId?: string) => {
     if (arrivalId) setReceiptTarget(arrivalId);
+    setReceivingPreset(null);
     setPage("receiving");
+  };
+
+  const openReceiving = (preset: ReceivingPreset | null) => {
+    setReceivingPreset(preset);
+    setPage("receiving");
+    window.scrollTo({ top: 0 });
+  };
+
+  const openHistory = (preset: HistoryPreset | null) => {
+    setHistoryPreset(preset);
+    setPage("history");
+    window.scrollTo({ top: 0 });
   };
 
   const Sidebar = ({ mobile = false }: { mobile?: boolean }) => {
@@ -269,18 +574,17 @@ export default function VendorManagement(props: Props) {
           {!isCollapsed && <div className="text-left leading-tight min-w-0"><div className="text-xs font-bold text-white tracking-wide truncate">TRI-M VENDOR</div><div className="text-[10px] text-slate-400 tracking-wider">RECEIVING &amp; MONITORING</div></div>}
         </div>
         <nav className={isCollapsed ? "flex-1 py-2 px-2 space-y-1" : "flex-1 overflow-y-auto py-2 px-3 space-y-1"}>
-          {NAV.map(({ icon, label, page: p }) => (
-            <button key={p} onClick={() => { setPage(p); setMobileOpen(false); }}
-              className={`group relative w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all text-left ${isCollapsed ? "justify-center" : ""} ${page === p ? "bg-violet-500/20 text-white" : "text-slate-300 hover:text-white hover:bg-white/5"}`}>
+          {navItems.map(({ icon, label, page: p }) => (
+            <button key={p} onClick={() => { setPage(p); setMobileOpen(false); if (p === "receiving") setReceivingPreset(null); if (p === "history") setHistoryPreset(null); }}
+              className={`group relative w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all text-left ${isCollapsed ? "justify-center" : ""} ${currentPage === p ? "bg-violet-500/20 text-white" : "text-slate-300 hover:text-white hover:bg-white/5"}`}>
               {icon}
               {!isCollapsed && <span className="flex-1 truncate">{label}</span>}
-              {!isCollapsed && p === "notifications" && unread > 0 && <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">{unread}</span>}
               {isCollapsed && <span className="pointer-events-none absolute left-full ml-3 top-1/2 -translate-y-1/2 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-lg transition-opacity group-hover:opacity-100 z-50">{label}</span>}
             </button>
           ))}
         </nav>
         <div className="px-3 pt-2 pb-4 mt-auto space-y-1">
-          <button onClick={onLogout} className={`group relative w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-300 hover:text-red-400 hover:bg-red-500/10 ${isCollapsed ? "justify-center" : ""}`}>
+          <button onClick={() => setLogoutConfirm(true)} className={`group relative w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-300 hover:text-red-400 hover:bg-red-500/10 ${isCollapsed ? "justify-center" : ""}`}>
             <LogOut size={16} />{!isCollapsed && <span className="flex-1 text-left">Logout</span>}
             {isCollapsed && <span className="pointer-events-none absolute left-full ml-3 top-1/2 -translate-y-1/2 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs text-white opacity-0 group-hover:opacity-100">Logout</span>}
           </button>
@@ -312,15 +616,16 @@ export default function VendorManagement(props: Props) {
             <button onClick={() => setMobileOpen(true)} className="lg:hidden p-2 text-slate-500 hover:text-slate-800 rounded-lg hover:bg-slate-100"><Menu size={20} /></button>
             <h2 className="font-bold text-slate-800 text-sm truncate">{currentLabel}</h2>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-full bg-green-50 text-green-700 border border-green-200"><span className="w-1.5 h-1.5 rounded-full bg-green-500" /> Authorized Staff</span>
-            <button onClick={() => toNext("notifications")} className="relative p-2 text-slate-500 hover:text-slate-800 rounded-lg hover:bg-slate-100 transition-colors" title="Notifications">
-              <Bell size={18} />
-              {unread > 0 && <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full" />}
-            </button>
-          </div>
+<div className="flex items-center gap-2 shrink-0">
+              <span className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-full bg-green-50 text-green-700 border border-green-200"><span className="w-1.5 h-1.5 rounded-full bg-green-500" /> {ROLE_LABELS[role] ?? "Authorized Staff"}</span>
+              <button ref={bellRef} onClick={toggleNotifs} aria-expanded={notifOpen} aria-haspopup="menu" className={`relative p-2 rounded-lg transition-colors ${notifOpen ? "text-[#5b21b6] bg-violet-50" : "text-slate-500 hover:text-slate-800 hover:bg-slate-100"}`} title="Notifications" aria-label="Notifications">
+                <Bell size={18} />
+                {unread > 0 && <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full bg-red-500 text-white text-[10px] font-bold leading-none">{unread > 99 ? "99+" : unread}</span>}
+              </button>
+              <NotifPopover open={notifOpen} bellRef={bellRef} onClose={() => setNotifOpen(false)} data={data} actions={actions} />
+            </div>
         </header>
-        <main className="flex-1 overflow-y-auto p-4 sm:p-6">
+        <main className="flex-1 overflow-y-auto overflow-x-hidden p-4 sm:p-6">
           {loading ? (
             <div className="max-w-[1440px] mx-auto">
               <Card className="p-12 text-center">
@@ -336,20 +641,26 @@ export default function VendorManagement(props: Props) {
                   <AlertTriangle size={14} className="shrink-0 mt-0.5" />{error}
                 </div>
               )}
-              <div key={page} className="page-enter mx-auto max-w-[1440px]">
-                {page === "dashboard" && <Dashboard data={data} goTo={toNext} startReceiving={startReceiving} />}
-                {page === "receiving" && <Receiving data={data} actions={actions} target={receiptTarget} onTargetConsumed={() => setReceiptTarget(null)} goTo={toNext} />}
-                {page === "monitor" && <SupplyMonitoring data={data} actions={actions} startReceiving={startReceiving} goTo={toNext} />}
-                {page === "request" && <RequestSupply data={data} actions={actions} goTo={toNext} />}
-                {page === "suppliers" && <Suppliers data={data} actions={actions} />}
-                {page === "history" && <ReceivingHistory data={data} />}
-                {page === "notifications" && <Notifications data={data} actions={actions} />}
-                {page === "company" && <CompanyProfile profile={data.profile} />}
+              <div key={currentPage} className="page-enter mx-auto max-w-[1440px]">
+                {currentPage === "dashboard" && <Dashboard role={role} data={data} goTo={toNext} startReceiving={startReceiving} actions={actions} onOpenReceiving={openReceiving} onOpenHistory={openHistory} />}
+                {currentPage === "receiving" && <Receiving data={data} actions={actions} target={receiptTarget} onTargetConsumed={() => setReceiptTarget(null)} goTo={toNext} preset={receivingPreset} onPresetConsumed={() => setReceivingPreset(null)} />}
+                {currentPage === "monitor" && <SupplyMonitoring data={data} actions={actions} startReceiving={startReceiving} goTo={toNext} />}
+                {currentPage === "request" && <RequestSupply data={data} actions={actions} goTo={toNext} />}
+                {currentPage === "suppliers" && <Suppliers data={data} actions={actions} />}
+                {currentPage === "history" && <ReceivingHistory data={data} actions={actions} preset={historyPreset} onPresetConsumed={() => setHistoryPreset(null)} />}
               </div>
             </div>
           )}
         </main>
         <div id="modal-portal" />
+        <LogoutConfirmModal open={logoutConfirm} onClose={() => setLogoutConfirm(false)} onConfirm={onLogout} />
+        <SessionWarnModal
+          open={sessionWarnOpen}
+          busy={sessionTouchBusy}
+          error={sessionWarnErr}
+          onStay={() => void handleStayLoggedIn()}
+          onLogout={onLogout}
+        />
       </div>
     </div>
   );
@@ -357,8 +668,14 @@ export default function VendorManagement(props: Props) {
 
 /* ── dashboard ─────────────────────────────────────────── */
 
-const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p: Page) => void; startReceiving: (id?: string) => void }) => {
+const Dashboard = ({ role, data, goTo, startReceiving, actions, onOpenReceiving, onOpenHistory }: {
+  role: string; data: VendorData; goTo: (p: Page) => void; startReceiving: (id?: string) => void;
+  actions: VendorActions;
+  onOpenReceiving: (preset: ReceivingPreset | null) => void;
+  onOpenHistory: (preset: HistoryPreset | null) => void;
+}) => {
   const { arrivals, receipts, suppliers, supplyRequests } = data;
+  const [viewingRec, setViewingRec] = React.useState<SupplyReceipt | null>(null);
   const count = (s: SupplyStatus) => arrivals.filter(a => a.status === s).length;
   const expected = count("expected");
   const forReceiving = count("for_receiving");
@@ -374,6 +691,7 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
 
   const recentReceipts = [...receipts].sort((a, b) => +new Date(b.receivedAt) - +new Date(a.receivedAt)).slice(0, 5);
   const recentNotifs = data.notifications.slice(0, 4);
+  const unreadNotifs = data.notifications.filter(n => !n.read).length;
   const upcoming = arrivals.filter(a => a.status === "expected" || a.status === "for_receiving")
     .sort((a, b) => +a.expectedDate - +b.expectedDate).slice(0, 5);
 
@@ -384,7 +702,7 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
           <div className="w-12 h-12 rounded-2xl bg-[#5b21b6] text-white flex items-center justify-center"><Boxes size={24} /></div>
           <div>
             <h1 className="text-lg font-bold text-slate-800">Vendor Management Overview</h1>
-            <p className="text-xs text-slate-400">Receive, record, and monitor supplies provided through the Supply Chain subsystem.</p>
+            <p className="text-xs text-slate-400">Receive, record, and monitor supplies delivered to Tri-M.</p>
           </div>
         </div>
         <div className="flex gap-2 flex-wrap">
@@ -393,21 +711,23 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
         </div>
       </Card>
 
-      <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
-        <KpiCard icon={<Clock size={18} className="text-sky-600" />} label="Expected Deliveries" value={expected} sub={expected > 0 ? "Awaiting arrival" : "No upcoming"} color="bg-sky-50" />
-        <KpiCard icon={<Truck size={18} className="text-amber-600" />} label="For Receiving" value={forReceiving} sub="At facility, pending receive" color="bg-amber-50" />
-        <KpiCard icon={<Boxes size={18} className="text-green-600" />} label="Supplies Received" value={receipts.length} sub="Total receiving transactions" color="bg-green-50" />
-        <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Received" value={partial} sub="Balance pending" color="bg-orange-50" />
-        <KpiCard icon={<PackageCheck size={18} className="text-indigo-600" />} label="Completed Receiving" value={completed} sub="Closed & forwarded" color="bg-indigo-50" />
-        <KpiCard icon={<AlertTriangle size={18} className="text-red-600" />} label="Issues / Damaged" value={rejected} sub={rejected > 0 ? "Needs attention" : "No issues"} color="bg-red-50" />
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6 gap-4">
+        <KpiCard icon={<Clock size={18} className="text-sky-600" />} label="Expected Deliveries" value={expected} sub={expected > 0 ? "Awaiting arrival" : "No upcoming"} color="bg-sky-50" onClick={() => onOpenReceiving({ arrivalStatus: "expected" })} />
+        <KpiCard icon={<Truck size={18} className="text-amber-600" />} label="For Receiving" value={forReceiving} sub="At facility, pending receive" color="bg-amber-50" onClick={() => onOpenReceiving({ arrivalStatus: "for_receiving" })} />
+        <KpiCard icon={<Boxes size={18} className="text-green-600" />} label="Supplies Received" value={receipts.length} sub="Total receiving transactions" color="bg-green-50" onClick={() => onOpenHistory(null)} />
+        <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Received" value={partial} sub="Balance pending" color="bg-orange-50" onClick={() => onOpenReceiving({ arrivalStatus: "partially_received" })} />
+        <KpiCard icon={<PackageCheck size={18} className="text-indigo-600" />} label="Completed Receiving" value={completed} sub="Closed & forwarded" color="bg-indigo-50" onClick={() => onOpenHistory({ arrivalStatus: "completed" })} />
+        <KpiCard icon={<AlertTriangle size={18} className="text-red-600" />} label="Issues / Damaged" value={rejected} sub={rejected > 0 ? "Needs attention" : "No issues"} color="bg-red-50" onClick={() => onOpenHistory({ issuesOnly: true })} />
       </div>
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <KpiCard icon={<ClipboardPlus size={18} className="text-violet-600" />} label="Requests In Progress" value={pendingRequests} sub="Submitted → Fulfillment" color="bg-violet-50" />
-        <KpiCard icon={<Clock size={18} className="text-amber-600" />} label="Under Review" value={underReview} sub="With Supply Chain" color="bg-amber-50" />
-        <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Fulfilled" value={partialRequests} sub="Balance pending" color="bg-orange-50" />
-        <KpiCard icon={<CheckCircle2 size={18} className="text-green-600" />} label="Requests Fulfilled" value={fulfilledRequests} sub="Fully delivered" color="bg-green-50" />
-      </div>
+      {role === "admin" && (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <KpiCard icon={<ClipboardPlus size={18} className="text-violet-600" />} label="Requests In Progress" value={pendingRequests} sub="Submitted → Fulfillment" color="bg-violet-50" />
+          <KpiCard icon={<Clock size={18} className="text-amber-600" />} label="Under Review" value={underReview} sub="With Supply Chain" color="bg-amber-50" />
+          <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Fulfilled" value={partialRequests} sub="Balance pending" color="bg-orange-50" />
+          <KpiCard icon={<CheckCircle2 size={18} className="text-green-600" />} label="Requests Fulfilled" value={fulfilledRequests} sub="Fully delivered" color="bg-green-50" />
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
         <Card className="p-5 lg:col-span-7">
@@ -416,39 +736,39 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
               <div className="w-8 h-8 rounded-lg bg-violet-50 text-violet-600 flex items-center justify-center"><ClipboardList size={16} /></div>
               <h3 className="text-sm font-bold text-slate-800">Recent Supply Receipts</h3>
             </div>
-            <button onClick={() => goTo("history")} className="text-xs font-semibold text-violet-600 hover:text-violet-800 flex items-center gap-1">View all <ChevronRight size={13} /></button>
+            <button onClick={() => onOpenHistory(null)} className="text-xs font-semibold text-violet-600 hover:text-violet-800 flex items-center gap-1">View all <ChevronRight size={13} /></button>
           </div>
           <div className="space-y-2">
             {recentReceipts.map(r => (
-              <div key={r.id} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100 hover:border-violet-200 hover:bg-violet-50/30 transition-colors">
+              <button key={r.id} type="button" onClick={() => setViewingRec({ ...r })} title="View receiving details" className="w-full text-left flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100 hover:border-violet-200 hover:bg-violet-50/30 transition-colors cursor-pointer group">
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-slate-700 flex items-center gap-2 truncate"><MonoId id={r.id} /><span className="truncate">{r.supplierName}</span></p>
                   <p className="text-xs text-slate-400 truncate">{r.items.map(i => `${i.productName} (${i.qty} ${i.unit})`).join(", ")}</p>
                 </div>
-                <div className="flex flex-col items-end gap-1 shrink-0"><ReceiptStatusPill rec={r} /><span className="text-[11px] text-slate-400">{fmtDateTime(r.receivedAt)}</span></div>
-              </div>
+                <div className="flex flex-col items-end gap-1 shrink-0"><ReceiptStatusPill rec={r} /><span className="text-[11px] text-slate-400 flex items-center gap-1">{fmtDateTime(r.receivedAt)}<Eye size={11} className="text-slate-300 group-hover:text-violet-500 transition-colors" /></span></div>
+              </button>
             ))}
             {recentReceipts.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No receiving transactions yet.</p>}
           </div>
         </Card>
 
         <Card className="p-5 lg:col-span-5">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-lg bg-red-50 text-red-600 flex items-center justify-center"><Bell size={16} /></div>
-              <h3 className="text-sm font-bold text-slate-800">Recent Notifications</h3>
+<div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-lg bg-red-50 text-red-600 flex items-center justify-center"><Bell size={16} /></div>
+                <h3 className="text-sm font-bold text-slate-800">Recent Notifications</h3>
+              </div>
+              {unreadNotifs > 0 && <span className="text-[11px] font-bold text-red-500">{unreadNotifs} unread</span>}
             </div>
-            <button onClick={() => goTo("notifications")} className="text-xs font-semibold text-violet-600 hover:text-violet-800 flex items-center gap-1">View all <ChevronRight size={13} /></button>
-          </div>
           <div className="space-y-2">
             {recentNotifs.map(n => (
-              <div key={n.id} className={`p-3 rounded-xl border ${n.read ? "border-slate-100" : "border-violet-200 bg-violet-50/40"}`}>
+              <button key={n.id} type="button" onClick={() => actions.markNotifRead(n.id)} title={n.read ? "Notification" : "Mark as read"} className={`w-full text-left p-3 rounded-xl border cursor-pointer transition-colors ${n.read ? "border-slate-100 hover:border-slate-200 hover:bg-slate-50" : "border-violet-200 bg-violet-50/40 hover:bg-violet-50/70"}`}>
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-semibold text-slate-700">{n.title}</span>
-                  <span className="text-[11px] text-slate-400">{fmtDate(n.timestamp)}</span>
+                  <span className={`text-[11px] ${n.read ? "text-slate-400" : "text-slate-500"} flex items-center gap-1`}>{fmtDate(n.timestamp)}{!n.read && <span className="w-1.5 h-1.5 rounded-full bg-violet-500 inline-block" />}</span>
                 </div>
                 <p className="text-xs text-slate-500 leading-snug">{n.message}</p>
-              </div>
+              </button>
             ))}
             {recentNotifs.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No notifications yet.</p>}
           </div>
@@ -466,13 +786,13 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
           </div>
           <div className="space-y-2">
             {upcoming.map(a => (
-              <div key={a.id} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100 hover:border-violet-200 hover:bg-violet-50/30 transition-colors">
+              <button key={a.id} type="button" onClick={() => startReceiving(a.id)} title="Open receiving for this delivery" className="w-full text-left flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100 hover:border-violet-200 hover:bg-violet-50/30 transition-colors cursor-pointer group">
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-slate-700 flex items-center gap-2 truncate"><MonoId id={a.id} /><span className="truncate">{a.supplierName}</span></p>
                   <p className="text-xs text-slate-400 truncate">{a.items.map(i => `${i.productName} (${i.qty} ${i.unit})`).join(", ")}</p>
                 </div>
-                <div className="flex flex-col items-end gap-1 shrink-0"><SupplyBadge status={a.status} /><span className="text-[11px] text-slate-400">{fmtDate(a.expectedDate)} · {a.destination}</span></div>
-              </div>
+                <div className="flex flex-col items-end gap-1 shrink-0"><SupplyBadge status={a.status} /><span className="text-[11px] text-slate-400 flex items-center gap-1">{fmtDate(a.expectedDate)} · {a.destination}<Eye size={11} className="text-slate-300 group-hover:text-violet-500 transition-colors" /></span></div>
+              </button>
             ))}
             {upcoming.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No expected deliveries.</p>}
           </div>
@@ -502,10 +822,12 @@ const Dashboard = ({ data, goTo, startReceiving }: { data: VendorData; goTo: (p:
                 </div>
               );
             })}
-            {suppliers.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No supplier records. Supply Chain data expected.</p>}
+            {suppliers.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No supplier records found.</p>}
           </div>
         </Card>
       </div>
+
+      <ReceiptDetailsModal rec={viewingRec} onClose={() => setViewingRec(null)} />
     </div>
   );
 };
@@ -648,16 +970,16 @@ const RequestForm = ({ open, onClose, editing, data, actions }: {
         </div>
       }>
       <div className="space-y-5">
-        <div className="bg-violet-50 border border-violet-200 rounded-xl p-3 flex gap-2 text-xs text-violet-700"><Info size={14} className="shrink-0 mt-0.5" /> This request tells the Supply Chain subsystem what supplies Tri-M needs. Supplier sourcing, selection, and procurement are managed by Supply Chain — not here.</div>
+        <div className="bg-violet-50 border border-violet-200 rounded-xl p-3 flex gap-2 text-xs text-violet-700"><Info size={14} className="shrink-0 mt-0.5" /> This request records the supplies Tri-M needs so they can be coordinated and delivered.</div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Request Reference" hint="Assigned automatically by the backend">
+          <Field label="Request Reference" hint="Generated automatically">
             <input className={`${inp} bg-slate-50 text-slate-500`} value={editing?.id ?? "VR-YYYY-NNNN"} disabled />
           </Field>
-          <Field label="Requested By" hint="Authenticated user — cannot be changed">
-            <input className={`${inp} bg-slate-50 text-slate-500`} value="Administrator" disabled />
+          <Field label="Requested By" hint="Current signed-in user">
+            <input className={`${inp} bg-slate-50 text-slate-500`} value={getSessionUser()?.displayName?.trim() || "Administrator"} disabled />
           </Field>
-          <Field label="Request Date" hint="Assigned automatically by the backend">
+          <Field label="Request Date" hint="Generated automatically">
             <input className={`${inp} bg-slate-50 text-slate-500`} value={editing ? fmtDateTime(editing.requestDate) : fmtDateTime(new Date().toISOString())} disabled />
           </Field>
           <Field label="Needed By Date" required error={fieldErr.neededByDate}>
@@ -765,7 +1087,7 @@ const RequestDetail = ({ request, onClose, onEdit, actions }: {
           <div className="flex flex-wrap gap-3 justify-end">
             <Btn variant="secondary" size="sm" onClick={onClose}>Close</Btn>
             {request.status === "draft" && <Btn variant="secondary" size="sm" onClick={onEdit} disabled={busy}><Save size={13} /> Edit Draft</Btn>}
-            {request.status === "draft" && <Btn size="sm" onClick={() => { if (confirm(`Submit ${request.id} to the Supply Chain subsystem?`)) run(actions.submitSupplyRequest, request.id, "Failed to submit the request."); }} disabled={busy}><Send size={13} /> Submit Request</Btn>}
+            {request.status === "draft" && <Btn size="sm" onClick={() => { if (confirm(`Submit ${request.id} for Supply Chain coordination?`)) run(actions.submitSupplyRequest, request.id, "Failed to submit the request."); }} disabled={busy}><Send size={13} /> Submit Request</Btn>}
             {(request.status === "draft" || request.status === "submitted") && <Btn variant="danger" size="sm" onClick={() => { if (confirm(`Cancel ${request.id}?`)) run(actions.cancelSupplyRequest, request.id, "Failed to cancel the request."); }} disabled={busy}><XCircle size={13} /> Cancel Request</Btn>}
           </div>
         </div>
@@ -774,7 +1096,7 @@ const RequestDetail = ({ request, onClose, onEdit, actions }: {
         <div className="flex flex-wrap items-center justify-between gap-2"><MonoId id={request.id} /><RequestStatusBadge status={request.status} /></div>
 
         {line("Request Date", fmtDateTime(request.requestDate), <CalendarClock size={14} />)}
-        {line("Requested By", "Administrator (authenticated user)", <Users size={14} />)}
+        {line("Requested By", getSessionUser()?.displayName?.trim() || "Administrator", <Users size={14} />)}
         {line("Needed By Date", fmtDate(request.neededByDate), <CalendarClock size={14} />)}
         {line("Priority", <PriorityPill priority={request.priority} />, <AlertTriangle size={14} />)}
         {line("Reason / Purpose", request.reason || "—", <FileText size={14} />)}
@@ -813,14 +1135,14 @@ const RequestDetail = ({ request, onClose, onEdit, actions }: {
           </div>
           {partial && <p className="text-xs text-orange-600 mt-2 flex items-center gap-1"><RefreshCw size={12} /> Partially fulfilled — remaining quantities are pending from Supply Chain.</p>}
           {full && <p className="text-xs text-green-700 mt-2 flex items-center gap-1"><CheckCircle2 size={12} /> All requested quantities have been fulfilled.</p>}
-          {!partial && !full && <p className="text-xs text-slate-400 mt-2">Fulfillment is derived from receiving records once Supply Chain schedules deliveries.</p>}
+          {!partial && !full && <p className="text-xs text-slate-400 mt-2">Fulfillment updates once the scheduled deliveries arrive.</p>}
         </div>
 
         {(request.scReference || request.supplierName || request.processingStatus || request.expectedDeliveryDate) && (
           <div className="bg-sky-50 border border-sky-200 rounded-xl p-3">
             <p className="text-[11px] uppercase tracking-wide font-semibold text-sky-700 mb-2 flex items-center gap-1"><Info size={12} /> Supply Chain Information</p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs text-slate-700">
-              {request.scReference && <div className="flex gap-2"><span className="text-slate-400">SC Reference:</span><MonoId id={request.scReference} /></div>}
+              {request.scReference && <div className="flex gap-2"><span className="text-slate-400">Supply Chain Ref:</span><MonoId id={request.scReference} /></div>}
               {request.processingStatus && <div className="flex gap-2"><span className="text-slate-400">Processing:</span><span className="font-semibold capitalize">{request.processingStatus}</span></div>}
               {request.supplierName && <div className="flex gap-2"><span className="text-slate-400">Supplier:</span><strong>{request.supplierName}</strong></div>}
               {request.expectedDeliveryDate && <div className="flex gap-2"><span className="text-slate-400">Expected Delivery:</span>{fmtDate(request.expectedDeliveryDate)}</div>}
@@ -898,7 +1220,7 @@ const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: Ven
                     </div></td>
                   </tr>
                 ))}
-                {filtered.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-sm text-slate-400">No supply requests found. Click "Create Request" to request supplies from the Supply Chain subsystem.</td></tr>}
+                {filtered.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-sm text-slate-400">No supply requests found. Click "Create Request" to request supplies.</td></tr>}
               </tbody>
             </table>
           </div>
@@ -989,7 +1311,7 @@ const initialReceiptDraft = (): ReceiptFormDraft => ({
   supplierId: "",
   items: [emptyItem()],
   receivedAt: localNowValue(),
-  receivingBy: "R. Dela Cruz",
+  receivingBy: getSessionUser()?.displayName?.trim() ?? "",
   docRef: "",
   remarks: "",
 });
@@ -1117,10 +1439,10 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
         </div>
       }>
       <div className="space-y-5">
-        <div className="bg-violet-50 border border-violet-200 rounded-xl p-3 flex gap-2 text-xs text-violet-700"><Info size={14} className="shrink-0 mt-0.5" /> This module records physical receipt of supplies coordinated by the Supply Chain subsystem. No supplier sourcing decisions are made here.</div>
+        <div className="bg-violet-50 border border-violet-200 rounded-xl p-3 flex gap-2 text-xs text-violet-700"><Info size={14} className="shrink-0 mt-0.5" /> Record the physical receipt of supplies delivered to the facility. Damaged or rejected items are recorded separately.</div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Field label="Expected Supply (optional)" hint="Link to the SC delivery schedule being fulfilled">
+          <Field label="Expected Supply (optional)" hint="Link to the delivery schedule being fulfilled">
             <div className="relative">
               <select className={selectCls} value={draft.arrivalId} onChange={e => { const v = e.target.value; if (v) applyArrival(v); else { setDraft(d => ({ ...d, arrivalId: "" })); } }}>
                 <option value="">— Ad-hoc receiving —</option>
@@ -1142,7 +1464,7 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
 
         {arrival && (
           <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-600 flex flex-wrap gap-x-4 gap-y-1">
-            <span>SC schedule: <MonoId id={arrival.sourceRef} /></span>
+            <span>Delivery Schedule: <MonoId id={arrival.sourceRef} /></span>
             <span>Expected: {fmtDate(arrival.expectedDate)} {arrival.expectedTime}</span>
             <span>Destination: {arrival.destination}</span>
             <span>Status: <SupplyBadge status={arrival.status} /></span>
@@ -1193,10 +1515,13 @@ const ReceiptForm = ({ data, actions, open, editing, targetArrivalId, onClose, o
 
 /* ── receiving (record) ────────────────────────────────── */
 
-const Receiving = ({ data, actions, target, onTargetConsumed, goTo }: {
+const Receiving = ({ data, actions, target, onTargetConsumed, goTo, preset, onPresetConsumed }: {
   data: VendorData; actions: VendorActions;
   target: string | null; onTargetConsumed: () => void; goTo: (p: Page) => void;
+  preset?: ReceivingPreset | null; onPresetConsumed?: () => void;
 }) => {
+  const [presetLocal, setPresetLocal] = React.useState<ReceivingPreset | null>(preset ?? null);
+  const presetStatus = presetLocal?.arrivalStatus ?? null;
   const [formOpen, setFormOpen] = React.useState(false);
   const [formTarget, setFormTarget] = React.useState<string | null>(null);
   const [editing, setEditing] = React.useState<SupplyReceipt | null>(null);
@@ -1213,11 +1538,21 @@ const Receiving = ({ data, actions, target, onTargetConsumed, goTo }: {
 
   const openForm = (arrivalId?: string) => { setEditing(null); setFormTarget(arrivalId ?? null); setFormOpen(true); };
 
-  const queue = data.arrivals
+  const clearPreset = () => { setPresetLocal(null); onPresetConsumed?.(); };
+
+  const queueAll = data.arrivals
     .filter(a => a.status === "for_receiving" || a.status === "partially_received" || a.status === "received")
     .sort((a, b) => a.expectedDate.localeCompare(b.expectedDate));
 
-  const upcoming = data.arrivals.filter(a => a.status === "expected").sort((a, b) => a.expectedDate.localeCompare(b.expectedDate)).slice(0, 3);
+  const queue = presetStatus && presetStatus !== "expected" ? queueAll.filter(a => a.status === presetStatus) : queueAll;
+
+  const expectedOnly = presetStatus === "expected"
+    ? data.arrivals.filter(a => a.status === "expected").sort((a, b) => a.expectedDate.localeCompare(b.expectedDate))
+    : null;
+
+  const upcoming = presetStatus === "expected"
+    ? []
+    : data.arrivals.filter(a => a.status === "expected").sort((a, b) => a.expectedDate.localeCompare(b.expectedDate)).slice(0, 3);
 
   return (
     <div className="space-y-5">
@@ -1226,10 +1561,31 @@ const Receiving = ({ data, actions, target, onTargetConsumed, goTo }: {
           <h2 className="text-sm font-bold text-slate-800">Receiving Work Queue</h2>
           <p className="text-xs text-slate-400">Supplies at the facility, partially received, or awaiting final confirmation.</p>
         </div>
-        <Btn size="sm" onClick={() => openForm()}><PackagePlus size={14} /> Record Receiving</Btn>
+        <div className="flex items-center gap-2 flex-wrap">
+          {presetLocal && (
+            <button type="button" onClick={clearPreset} title="Show all" className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-violet-700 bg-violet-50 border border-violet-200 rounded-full px-2.5 py-1.5 hover:bg-violet-100 transition-colors cursor-pointer">
+              {RECEIVE_PRESET_LABEL[presetLocal.arrivalStatus]} only <X size={12} />
+            </button>
+          )}
+          <Btn size="sm" onClick={() => openForm()}><PackagePlus size={14} /> Record Receiving</Btn>
+        </div>
       </Card>
 
-      <div className="space-y-3">
+      {expectedOnly ? (
+        <Card className="p-4">
+          <div className="flex items-center gap-2 mb-3"><Clock size={15} className="text-sky-600" /><h3 className="text-sm font-bold text-slate-800">Expected Deliveries</h3></div>
+          <div className="space-y-2">
+            {expectedOnly.map(a => (
+              <button key={a.id} type="button" onClick={() => { clearPreset(); openForm(a.id); }} className="w-full text-left flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100 hover:border-violet-200 hover:bg-violet-50/30 transition-colors cursor-pointer group">
+                <div className="flex items-center gap-2 min-w-0"><MonoId id={a.id} /><span className="truncate text-slate-600">{a.supplierName} · {a.items.map(i => `${i.productName} (${i.qty} ${i.unit})`).join(", ")}</span></div>
+                <div className="flex items-center gap-2 shrink-0"><span className="text-slate-400">{fmtDate(a.expectedDate)} {a.expectedTime}</span><SupplyBadge status={a.status} /><Eye size={13} className="text-slate-300 group-hover:text-violet-500 transition-colors" /></div>
+              </button>
+            ))}
+            {expectedOnly.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No expected deliveries.</p>}
+          </div>
+        </Card>
+      ) : (
+        <div className="space-y-3">
         {queue.length === 0 && (
           <Card className="p-10 text-center">
             <PackageOpen size={28} className="text-slate-300 mx-auto mb-3" />
@@ -1266,7 +1622,8 @@ const Receiving = ({ data, actions, target, onTargetConsumed, goTo }: {
             </Card>
           );
         })}
-      </div>
+        </div>
+      )}
 
       {upcoming.length > 0 && (
         <Card className="p-4">
@@ -1361,7 +1718,7 @@ const SupplyMonitoring = ({ data, actions, startReceiving, goTo }: {
                 ))}
                 <div className="flex justify-between pt-1"><span>Expected</span><span>{fmtDate(a.expectedDate)} {a.expectedTime}</span></div>
                 <div className="flex justify-between"><span>Destination</span><span className="truncate">{a.destination}</span></div>
-                {a.sourceRef && <div className="flex justify-between"><span>SC Schedule</span><span className="font-mono text-[11px] text-slate-400">{a.sourceRef}</span></div>}
+                {a.sourceRef && <div className="flex justify-between"><span>Delivery Schedule</span><span className="font-mono text-[11px] text-slate-400">{a.sourceRef}</span></div>}
               </div>
               <ProgressBar received={qty} total={a.totalQty} bad={bad} />
               {a.remarks && <p className="text-[11px] text-slate-400 mt-2 italic truncate">{a.remarks}</p>}
@@ -1391,7 +1748,7 @@ const SupplyMonitoring = ({ data, actions, startReceiving, goTo }: {
 
       <Card className="p-5">
         <div className="flex items-center gap-2 mb-3"><Boxes size={16} className="text-green-600" /><h3 className="text-sm font-bold text-slate-800">Supply Availability — Received Quantities</h3></div>
-        <div className="overflow-x-auto">
+        <div className="hidden md:block overflow-x-auto">
           <table className="w-full min-w-[560px]">
             <thead><tr className="text-xs font-bold text-slate-500 uppercase tracking-wide border-b border-slate-100 bg-slate-50/60">
               <th className="text-left px-4 py-2">Product / Supply</th><th className="text-left px-4 py-2">Supplier</th><th className="text-right px-4 py-2">Qty Received</th><th className="text-left px-4 py-2">Unit</th>
@@ -1408,6 +1765,18 @@ const SupplyMonitoring = ({ data, actions, startReceiving, goTo }: {
               {avSummary.length === 0 && <tr><td colSpan={4} className="text-center py-8 text-sm text-slate-400">No good-condition receipts recorded yet.</td></tr>}
             </tbody>
           </table>
+        </div>
+        <div className="md:hidden space-y-2">
+          {avSummary.map((r, i) => (
+            <div key={i} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-100">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-slate-700 truncate">{r.product}</p>
+                <p className="text-xs text-slate-400 truncate">{r.supplier}</p>
+              </div>
+              <div className="text-right shrink-0"><p className="text-sm font-bold text-slate-800 whitespace-nowrap">{r.qty.toLocaleString()} {r.unit}</p><p className="text-[11px] text-slate-400">received</p></div>
+            </div>
+          ))}
+          {avSummary.length === 0 && <p className="text-sm text-slate-400 text-center py-6">No good-condition receipts recorded yet.</p>}
         </div>
       </Card>
     </div>
@@ -1430,9 +1799,8 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
       <Card className="p-4 flex flex-col sm:flex-row gap-3 items-stretch">
         <div className="relative flex-1">
           <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input className={`${inp} pl-9`} placeholder="Search supplier ID, company, SC source ref, contact…" value={q} onChange={e => setQ(e.target.value)} />
+          <input className={`${inp} pl-9`} placeholder="Search supplier ID, company, or contact…" value={q} onChange={e => setQ(e.target.value)} />
         </div>
-        <div className="sm:w-72 bg-sky-50 border border-sky-200 rounded-xl px-3 py-2 text-[11px] text-sky-700 flex items-center gap-2"><Info size={13} className="shrink-0" />Supplier records are provided by the Supply Chain subsystem. Sourcing &amp; selection happen upstream.</div>
       </Card>
 
       <div className="hidden xl:block">
@@ -1442,7 +1810,7 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
               <thead>
                 <tr className="text-xs font-bold text-slate-500 uppercase tracking-wide border-b border-slate-100 bg-slate-50/60">
                   <th className="text-left px-4 py-3">Supplier</th>
-                  <th className="text-left px-4 py-3">SC Source Ref</th>
+                  <th className="text-left px-4 py-3">Source Ref</th>
                   <th className="text-left px-4 py-3">Contact</th>
                   <th className="text-left px-4 py-3">Products Provided</th>
                   <th className="text-left px-4 py-3">Established</th>
@@ -1462,7 +1830,7 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
                     <td className="px-4 py-3"><div className="flex justify-end"><Btn size="sm" variant="secondary" onClick={() => setViewing({ ...s })}><Eye size={12} /> View</Btn></div></td>
                   </tr>
                 ))}
-                {filtered.length === 0 && <tr><td colSpan={7} className="text-center py-10 text-sm text-slate-400">No supplier records. Supplier data comes from the Supply Chain subsystem.</td></tr>}
+                {filtered.length === 0 && <tr><td colSpan={7} className="text-center py-10 text-sm text-slate-400">No supplier records found.</td></tr>}
               </tbody>
             </table>
           </div>
@@ -1480,7 +1848,7 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
               <div className="flex gap-2"><Users size={12} className="text-slate-400 mt-0.5" />{s.contactName} · {s.supplierType}</div>
               <div className="flex gap-2"><Mail size={12} className="text-slate-400 mt-0.5" />{s.contactEmail}</div>
               <div className="flex gap-2"><PackageOpen size={12} className="text-slate-400 mt-0.5" />{s.products.map(p => p.name).join(", ") || "—"}</div>
-              <div className="flex gap-2"><Info size={12} className="text-slate-400 mt-0.5" />SC Ref <MonoId id={s.sourceRef} /></div>
+              <div className="flex gap-2"><Info size={12} className="text-slate-400 mt-0.5" />Source Ref <MonoId id={s.sourceRef} /></div>
             </div>
             <Btn size="sm" variant="secondary" className="w-full" onClick={() => setViewing({ ...s })}><Eye size={12} /> View Supplier</Btn>
           </Card>
@@ -1492,7 +1860,7 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
         footer={viewing && <div className="flex gap-3 justify-end"><Btn variant="secondary" size="sm" onClick={() => setViewing(null)}>Close</Btn><Btn size="sm" onClick={() => { actions.toggleSupplierActive(viewing.id); setViewing({ ...viewing, status: viewing.status === "active" ? "inactive" : "active" }); }}>{viewing.status === "active" ? <><XCircle size={13} /> Mark Inactive</> : <><CheckCircle size={13} /> Mark Active</>}</Btn></div>}>
         {viewing && (
           <div className="space-y-4">
-            <div className="bg-sky-50 border border-sky-200 rounded-xl p-3 flex gap-2 text-xs text-sky-700"><Info size={14} className="shrink-0 mt-0.5" /> Provided by the Supply Chain subsystem (source ref <MonoId id={viewing.sourceRef} />). Status toggles are for operational monitoring only.</div>
+            <div className="bg-sky-50 border border-sky-200 rounded-xl p-3 flex gap-2 text-xs text-sky-700"><Info size={14} className="shrink-0 mt-0.5" /> Status toggles are for operational monitoring only.</div>
             <div className="flex items-center justify-between flex-wrap gap-2"><MonoId id={viewing.id} /><SupStatusPill status={viewing.status} /></div>
             {[
               { k: "Company Name", v: viewing.companyName, i: <Building2 size={14} /> },
@@ -1502,7 +1870,7 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
               { k: "Address", v: viewing.address, i: <MapPin size={14} /> },
               { k: "Company", v: `${viewing.email} · ${viewing.phone}${viewing.website ? ` · ${viewing.website}` : ""}`, i: <Phone size={14} /> },
               { k: "Distribution Area", v: viewing.distributionArea || "—", i: <MapPin size={14} /> },
-              { k: "Established (via SC)", v: fmtDate(viewing.establishedOn), i: <Clock size={14} /> },
+              { k: "Established On", v: fmtDate(viewing.establishedOn), i: <Clock size={14} /> },
             ].map(r => (
               <div key={r.k} className="flex gap-3 py-3 border-b border-slate-100 last:border-0">
                 <div className="text-slate-400 mt-0.5">{r.i}</div>
@@ -1540,19 +1908,111 @@ const Suppliers = ({ data, actions }: { data: VendorData; actions: VendorActions
 
 /* ── receiving history ─────────────────────────────────── */
 
-const ReceivingHistory = ({ data }: { data: VendorData }) => {
+const ReceivingHistory = ({ data, actions, preset, onPresetConsumed }: {
+  data: VendorData; actions: VendorActions; preset?: HistoryPreset | null; onPresetConsumed?: () => void;
+}) => {
+  const [presetLocal, setPresetLocal] = React.useState<HistoryPreset | null>(preset ?? null);
   const [q, setQ] = React.useState("");
-  const [issOnly, setIssOnly] = React.useState(false);
+  const [issOnly, setIssOnly] = React.useState(!!preset?.issuesOnly);
   const [viewing, setViewing] = React.useState<SupplyReceipt | null>(null);
+  const [from, setFrom] = React.useState("");
+  const [to, setTo] = React.useState("");
+  const [range, setRange] = React.useState<{ from?: string; to?: string } | null>(null);
+  const [rangeError, setRangeError] = React.useState("");
+  const [rangeLoading, setRangeLoading] = React.useState(false);
+  const [filteredRows, setFilteredRows] = React.useState<SupplyReceipt[] | null>(null);
+  const [sortDir, setSortDir] = React.useState<"new" | "old">("new");
+  const [reportOpen, setReportOpen] = React.useState(false);
 
-  const filtered = [...data.receipts]
+  const openReport = () => {
+    const f = from.trim();
+    const t = to.trim();
+    if (f && t && f > t) {
+      setRangeError("Invalid date range. The From date cannot be later than the To date.");
+      return;
+    }
+    setReportOpen(true);
+  };
+
+  const presetFetched = React.useRef(false);
+
+  React.useEffect(() => {
+    if (!preset || presetFetched.current) return;
+    presetFetched.current = true;
+    onPresetConsumed?.();
+    const f = preset.from ?? "";
+    const t = preset.to ?? "";
+    if (!f && !t) return;
+    setFrom(f);
+    setTo(t);
+    setRangeLoading(true);
+    void (async () => {
+      const res = await actions.searchReceivingHistory(f || undefined, t || undefined);
+      setRangeLoading(false);
+      if (res.ok) {
+        setFilteredRows(res.rows);
+        setRange({ from: f || undefined, to: t || undefined });
+      } else {
+        setRangeError(res.error);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const applyFilter = async () => {
+    const f = from.trim();
+    const t = to.trim();
+    if (f && t && f > t) {
+      setRangeError("Invalid date range. The From date cannot be later than the To date.");
+      return;
+    }
+    setRangeError("");
+    setRangeLoading(true);
+    const res = await actions.searchReceivingHistory(f || undefined, t || undefined);
+    setRangeLoading(false);
+    if (res.ok) {
+      setFilteredRows(res.rows);
+      setRange(f || t ? { from: f || undefined, to: t || undefined } : null);
+    } else {
+      setRangeError(res.error);
+    }
+  };
+
+  const clearFilter = () => {
+    setFrom("");
+    setTo("");
+    setRange(null);
+    setRangeError("");
+    setFilteredRows(null);
+    setPresetLocal(null);
+  };
+
+  const editFrom = (v: string) => { setFrom(v); setFilteredRows(null); setRange(null); setRangeError(""); };
+  const editTo = (v: string) => { setTo(v); setFilteredRows(null); setRange(null); setRangeError(""); };
+
+  const base = (filteredRows ?? data.receipts).filter(r =>
+    presetLocal?.arrivalStatus
+      ? data.arrivals.find(a => a.id === r.arrivalId)?.status === presetLocal.arrivalStatus
+      : true
+  );
+  const filtered = [...base]
     .filter(r => {
       const qq = q.toLowerCase();
       const matchQ = !qq || r.id.toLowerCase().includes(qq) || r.supplierName.toLowerCase().includes(qq) || r.docRef.toLowerCase().includes(qq) || r.receivingBy.toLowerCase().includes(qq) || r.items.some(i => i.productName.toLowerCase().includes(qq));
       const matchIss = !issOnly || receiptHasIssue(r);
       return matchQ && matchIss;
     })
-    .sort((a, b) => +new Date(b.receivedAt) - +new Date(a.receivedAt));
+    .sort((a, b) =>
+      sortDir === "new"
+        ? +new Date(b.receivedAt) - +new Date(a.receivedAt)
+        : +new Date(a.receivedAt) - +new Date(b.receivedAt)
+    );
+
+  const emptyMessage = range
+    ? "No receiving records found for the selected date range."
+    : presetLocal?.arrivalStatus
+      ? `No ${SUPPLY_STATUS_CFG[presetLocal.arrivalStatus].label} receiving records found.`
+      : "No receiving transactions found.";
 
   return (
     <div className="space-y-5">
@@ -1562,7 +2022,33 @@ const ReceivingHistory = ({ data }: { data: VendorData }) => {
             <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input className={`${inp} pl-9`} placeholder="Search ref no., supplier, product, received by, doc ref…" value={q} onChange={e => setQ(e.target.value)} />
           </div>
-          <button onClick={() => setIssOnly(v => !v)} className={`px-3.5 py-2 text-xs font-semibold rounded-xl border transition-colors ${issOnly ? "bg-red-50 text-red-700 border-red-200" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"}`}><AlertTriangle size={13} className="inline -mt-0.5 mr-1" /> Issues / Damaged only</button>
+          <div className="flex gap-2 flex-wrap">
+            <button onClick={() => setIssOnly(v => !v)} className={`px-3.5 py-2 text-xs font-semibold rounded-xl border transition-colors ${issOnly ? "bg-red-50 text-red-700 border-red-200" : "bg-white text-slate-500 border-slate-200 hover:border-slate-300"}`}><AlertTriangle size={13} className="inline -mt-0.5 mr-1" /> Issues / Damaged only</button>
+            <button onClick={() => setSortDir(d => d === "new" ? "old" : "new")} className={`px-3.5 py-2 text-xs font-semibold rounded-xl border transition-colors ${sortDir === "new" ? "bg-white text-slate-500 border-slate-200 hover:border-slate-300" : "bg-violet-50 text-violet-700 border-violet-200"}`}><ArrowDownUp size={13} className="inline -mt-0.5 mr-1" /> {sortDir === "new" ? "Newest First" : "Oldest First"}</button>
+          </div>
+        </div>
+        <div className="mt-3 flex flex-col xl:flex-row xl:items-center gap-3">
+          <div className="flex flex-col sm:flex-row gap-3">
+            <label className="flex flex-col gap-1 text-[11px] font-semibold text-slate-500">
+              From Date
+              <input type="date" className={`${inp} min-h-[40px] py-2 text-sm`} value={from} max={to || undefined} onChange={e => editFrom(e.target.value)} />
+            </label>
+            <label className="flex flex-col gap-1 text-[11px] font-semibold text-slate-500">
+              To Date
+              <input type="date" className={`${inp} min-h-[40px] py-2 text-sm`} value={to} min={from || undefined} onChange={e => editTo(e.target.value)} />
+            </label>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <Btn size="sm" onClick={applyFilter} disabled={rangeLoading}><Search size={13} /> {rangeLoading ? "Filtering…" : "Apply Filter"}</Btn>
+            <Btn size="sm" variant="secondary" onClick={clearFilter} disabled={rangeLoading}>Clear Filter</Btn>
+            <Btn size="sm" variant="secondary" onClick={openReport} disabled={rangeLoading}><FileDown size={13} /> PDF Auto Reports</Btn>
+          </div>
+          {presetLocal?.arrivalStatus && (
+            <button type="button" onClick={clearFilter} title="Clear filter" className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-violet-700 bg-violet-50 border border-violet-200 rounded-full px-2.5 py-1.5 hover:bg-violet-100 transition-colors cursor-pointer">
+              {SUPPLY_STATUS_CFG[presetLocal.arrivalStatus].label} records only <X size={11} />
+            </button>
+          )}
+          {rangeError && <p className="text-xs font-semibold text-red-600 xl:ml-2">{rangeError}</p>}
         </div>
       </Card>
 
@@ -1595,7 +2081,7 @@ const ReceivingHistory = ({ data }: { data: VendorData }) => {
                     <td className="px-4 py-3"><div className="flex justify-end"><button onClick={() => setViewing({ ...r })} className="p-2 rounded-lg hover:bg-slate-50 border border-transparent hover:border-slate-200 text-slate-600 hover:text-violet-700" title="View details"><Eye size={14} /></button></div></td>
                   </tr>
                 ))}
-                {filtered.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-sm text-slate-400">No receiving transactions found.</td></tr>}
+                {filtered.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-sm text-slate-400">{emptyMessage}</td></tr>}
               </tbody>
             </table>
           </div>
@@ -1605,7 +2091,7 @@ const ReceivingHistory = ({ data }: { data: VendorData }) => {
           {filtered.map(r => (
             <Card key={r.id} className="p-4">
               <div className="flex items-start justify-between gap-2 mb-2">
-                <div><MonoId id={r.id} /><p className="text-sm font-bold text-slate-800 mt-1">{r.supplierName}</p></div>
+                <div className="min-w-0"><MonoId id={r.id} /><p className="text-sm font-bold text-slate-800 mt-1 truncate">{r.supplierName}</p></div>
                 <ReceiptStatusPill rec={r} />
               </div>
               <div className="space-y-1 text-xs text-slate-600 mb-3">
@@ -1616,156 +2102,145 @@ const ReceivingHistory = ({ data }: { data: VendorData }) => {
               <Btn size="sm" variant="secondary" className="w-full" onClick={() => setViewing({ ...r })}><Eye size={12} /> View Details</Btn>
             </Card>
           ))}
-          {filtered.length === 0 && <Card className="p-8 text-center col-span-full text-sm text-slate-400">No receiving transactions found.</Card>}
+          {filtered.length === 0 && <Card className="p-8 text-center col-span-full text-sm text-slate-400">{emptyMessage}</Card>}
         </div>
       </Card>
 
-      <Modal open={!!viewing} onClose={() => setViewing(null)} title={viewing ? `Receiving Transaction · ${viewing.id}` : "Receiving"} maxW="max-w-[680px]"
-        footer={viewing && <div className="flex justify-end"><Btn variant="secondary" size="sm" onClick={() => setViewing(null)}>Close</Btn></div>}>
-        {viewing && (
-          <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2"><MonoId id={viewing.id} /><ReceiptStatusPill rec={viewing} /></div>
-            {[
-              { k: "Supplier", v: `${viewing.supplierName}`, i: <Building2 size={14} /> },
-              { k: "Expected Supply", v: viewing.arrivalId || "Ad-hoc (no linked SC schedule)", i: <PackageOpen size={14} /> },
-              { k: "Date Received", v: fmtDateTime(viewing.receivedAt), i: <Clock size={14} /> },
-              { k: "Received By", v: viewing.receivingBy, i: <Users size={14} /> },
-              { k: "Document / Reference", v: viewing.docRef, i: <FileText size={14} /> },
-              { k: "Remarks", v: viewing.remarks || "—", i: <Info size={14} /> },
-            ].map(r => (
-              <div key={r.k} className="flex gap-3 py-3 border-b border-slate-100 last:border-0">
-                <div className="text-slate-400 mt-0.5">{r.i}</div>
-                <div className="flex-1 grid grid-cols-1 sm:grid-cols-[150px_1fr] gap-1">
-                  <p className="text-[11px] uppercase tracking-wide font-semibold text-slate-400">{r.k}</p>
-                  <p className="text-sm text-slate-700 break-words">{r.v}</p>
-                </div>
-              </div>
-            ))}
-            <div>
-              <p className="text-sm font-bold text-slate-700 mb-2">Received Items</p>
-              <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
-                {viewing.items.map((it, i) => (
-                  <div key={i} className="flex items-center justify-between gap-2 px-4 py-2.5">
-                    <span className="text-sm text-slate-700">{it.productName}</span>
-                    <span className="flex items-center gap-2"><strong className="text-slate-800 text-sm">{it.qty.toLocaleString()} {it.unit}</strong><ConditionPill condition={it.condition} /></span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
-      </Modal>
+      <ReceiptDetailsModal rec={viewing} onClose={() => setViewing(null)} />
+      <ReportPasswordModal open={reportOpen} onClose={() => setReportOpen(false)} from={from} to={to} />
     </div>
   );
 };
 
-/* ── notifications ─────────────────────────────────────── */
+/* ── notifications (bell popover) ──────────────────────── */
 
-const Notifications = ({ data, actions }: { data: VendorData; actions: VendorActions }) => {
+const fmtNotifTime = (ts: string) => {
+  const d = +new Date(ts);
+  if (Number.isNaN(d)) return fmtDate(ts);
+  const mins = Math.floor((Date.now() - d) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min${mins === 1 ? "" : "s"} ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hr${hrs === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days} day${days === 1 ? "" : "s"} ago`;
+  return fmtDate(ts);
+};
+
+const NotifPopover = ({ open, bellRef, onClose, data, actions }: {
+  open: boolean;
+  bellRef: React.RefObject<HTMLButtonElement | null>;
+  onClose: () => void;
+  data: VendorData;
+  actions: VendorActions;
+}) => {
+  const [pos, setPos] = React.useState<{ top: number; right: number } | null>(null);
+  const panelRef = React.useRef<HTMLDivElement | null>(null);
+  const hasOpened = React.useRef(false);
+
+  const measure = React.useCallback(() => {
+    const r = bellRef.current?.getBoundingClientRect();
+    if (!r) return;
+    const margin = 12;
+    const width = Math.min(384, window.innerWidth - margin * 2);
+    const right = Math.max(margin, Math.min(window.innerWidth - width - margin, window.innerWidth - r.right - margin));
+    setPos({ top: r.bottom + 8, right });
+  }, [bellRef]);
+
+  /* Keep a measured position even while closed so the exit animation renders */
+  React.useLayoutEffect(() => { measure(); }, [measure]);
+
+  /* Re-measure on resize/scroll while the panel is visible */
+  React.useLayoutEffect(() => {
+    if (!open) return;
+    measure();
+    window.addEventListener("resize", measure);
+    window.addEventListener("scroll", measure, true);
+    return () => {
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure, true);
+    };
+  }, [open, measure]);
+
+  React.useEffect(() => { if (open) hasOpened.current = true; }, [open]);
+
+  /* Click outside the panel and bell closes it */
+  React.useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t)) return;
+      if (bellRef.current?.contains(t)) return;
+      onClose();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [open, onClose, bellRef]);
+
+  /* Escape closes it */
+  React.useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  const animCls = open
+    ? "notif-in"
+    : hasOpened.current
+      ? "notif-out pointer-events-none"
+      : "pointer-events-none opacity-0";
+
   const notifIcon: Record<AppNotification["type"], { icon: React.ReactNode; cls: string }> = {
     info: { icon: <Info size={15} />, cls: "bg-sky-50 text-sky-600" },
     success: { icon: <CheckCircle2 size={15} />, cls: "bg-green-50 text-green-600" },
     warning: { icon: <AlertTriangle size={15} />, cls: "bg-orange-50 text-orange-600" },
     error: { icon: <AlertCircle size={15} />, cls: "bg-red-50 text-red-600" },
   };
-  return (
-    <div className="space-y-5">
-      <div className="flex justify-end gap-2">
-        <Btn size="sm" variant="secondary" onClick={() => actions.markAllNotifsRead()} disabled={data.notifications.every(n => n.read)}>Mark all read</Btn>
-        <Btn size="sm" variant="ghost" onClick={() => actions.clearNotifications()} disabled={data.notifications.length === 0}><Trash2 size={13} /> Clear all</Btn>
-      </div>
-      <Card className="divide-y divide-slate-100">
-        {data.notifications.map(n => {
-          const meta = notifIcon[n.type];
-          return (
-            <button key={n.id} onClick={() => actions.markNotifRead(n.id)} className={`w-full flex items-start gap-3 p-4 text-left transition-colors ${n.read ? "hover:bg-slate-50/60" : "bg-violet-50/40 hover:bg-violet-50/70"}`}>
-              <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${meta.cls}`}>{meta.icon}</div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center justify-between gap-2">
-                  <p className={`text-sm ${n.read ? "font-medium text-slate-700" : "font-bold text-slate-800"}`}>{n.title}</p>
-                  {!n.read && <span className="w-2 h-2 rounded-full bg-violet-500 shrink-0" />}
-                </div>
-                <p className="text-xs text-slate-500 mt-0.5">{n.message}</p>
-                <p className="text-[11px] text-slate-400 mt-1">{fmtDateTime(n.timestamp)}</p>
+  const unread = data.notifications.filter(n => !n.read).length;
+
+  return createPortal(
+    <>
+      {pos && (
+        <div ref={panelRef} role="menu" aria-hidden={!open} className={`fixed z-50 w-96 max-w-[calc(100vw-1.5rem)] bg-white rounded-2xl shadow-2xl border border-slate-100 overflow-hidden ${animCls}`} style={{ top: pos.top, right: pos.right }}>
+          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 bg-slate-50/60 min-h-[52px]">
+            <div className="flex items-center gap-2">
+              <Bell size={15} className="text-slate-500" />
+              <h3 className="text-sm font-bold text-slate-800">Notifications</h3>
+              {unread > 0 && <span className="min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-violet-600 text-white text-[10px] font-bold">{unread}</span>}
+            </div>
+            <div className="flex items-center gap-1">
+              <button onClick={() => actions.markAllNotifsRead()} className="text-[11px] font-semibold text-violet-600 hover:text-violet-800 px-2 py-1.5 rounded-lg hover:bg-violet-50" disabled={data.notifications.every(n => n.read)}>Mark all read</button>
+              <button onClick={() => actions.clearNotifications()} className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg hover:bg-red-50" title="Clear all" disabled={data.notifications.length === 0}><Trash2 size={13} /></button>
+            </div>
+          </div>
+          <div className="max-h-[min(60vh,420px)] overflow-y-auto divide-y divide-slate-100">
+            {data.notifications.map(n => {
+              const meta = notifIcon[n.type];
+              return (
+                <button key={n.id} onClick={() => actions.markNotifRead(n.id)} title={n.read ? "Notification read" : "Mark as read"} className={`w-full flex items-start gap-3 p-4 text-left transition-colors ${n.read ? "hover:bg-slate-50/60" : "bg-violet-50/40 hover:bg-violet-50/70"}`}>
+                  <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${meta.cls}`}>{meta.icon}</div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className={`text-sm ${n.read ? "font-medium text-slate-700" : "font-bold text-slate-800"}`}>{n.title}</p>
+                      {!n.read && <span className="w-2 h-2 rounded-full bg-violet-500 shrink-0" />}
+                    </div>
+                    <p className="text-xs text-slate-500 mt-0.5">{n.message}</p>
+                    <p className="text-[11px] text-slate-400 mt-1">{fmtNotifTime(n.timestamp)}</p>
+                  </div>
+                </button>
+              );
+            })}
+            {data.notifications.length === 0 && (
+              <div className="px-4 py-12 text-center">
+                <Bell size={22} className="mx-auto text-slate-300 mb-2" />
+                <p className="text-sm font-semibold text-slate-500">No notifications</p>
               </div>
-            </button>
-          );
-        })}
-        {data.notifications.length === 0 && <div className="p-10 text-center text-sm text-slate-400">No notifications.</div>}
-      </Card>
-    </div>
-  );
-};
-
-/* ── company profile ───────────────────────────────────── */
-/* Company identity comes from the vendors table via the backend
-   (GET /api/vendor/company) — not hardcoded in the frontend. */
-
-const CompanyProfile = ({ profile }: { profile: CompanyProfile | null }) => {
-  const steps = [
-    { t: "Supply Chain Subsystem", d: "Finds & sources suppliers, coordinates and acquires supply.", c: "bg-sky-50 text-sky-700 border-sky-200" },
-    { t: "Supplier & Supply Info", d: "Supplier records and supply schedules passed downstream.", c: "bg-violet-50 text-violet-700 border-violet-200" },
-    { t: "Vendor Management Module", d: "Receives, records, and monitors the incoming supply.", c: "bg-indigo-50 text-indigo-700 border-indigo-200" },
-    { t: "Receiving", d: "Records delivery details, quantity, condition, and personnel.", c: "bg-amber-50 text-amber-700 border-amber-200" },
-    { t: "Supply Monitoring", d: "Tracks received, pending, and completed receiving transactions.", c: "bg-green-50 text-green-700 border-green-200" },
-    { t: "Inventory / Stock Monitoring", d: "Forwarded received supply for stock monitoring downstream.", c: "bg-slate-100 text-slate-700 border-slate-200" },
-  ];
-
-  const companyName = profile?.companyName ?? "Tri-M Global Logistics & Trading Inc.";
-  const address = profile?.address ?? "Main Distribution Center (MDC), North Harbor, Manila";
-  const email = profile?.contactEmail ?? "vendor@trimi-global.ph";
-  const phone = profile?.contactPhone ?? "+63 2 8888 0000";
-
-  return (
-    <div className="space-y-5">
-      <Card className="p-6 flex flex-col sm:flex-row gap-5 items-start sm:items-center">
-        <div className="w-16 h-16 rounded-2xl bg-[#5b21b6] text-white flex items-center justify-center shrink-0"><Boxes size={30} /></div>
-        <div className="flex-1">
-          <h1 className="text-lg font-bold text-slate-800">{companyName}</h1>
-          <p className="text-xs text-slate-400 mt-0.5">Vendor Management Module — Supply receiving &amp; monitoring</p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 mt-3 text-xs text-slate-600">
-            <div className="flex gap-2"><MapPin size={12} className="text-slate-400 mt-0.5 shrink-0" />{address}</div>
-            <div className="flex gap-2"><Mail size={12} className="text-slate-400 mt-0.5 shrink-0" />{email}</div>
-            <div className="flex gap-2"><Phone size={12} className="text-slate-400 mt-0.5 shrink-0" />{phone}</div>
-            <div className="flex gap-2"><Building2 size={12} className="text-slate-400 mt-0.5 shrink-0" />Logistics &amp; Trading</div>
+            )}
           </div>
         </div>
-      </Card>
-
-      <Card className="p-5">
-        <div className="flex items-center gap-2 mb-1"><PackageOpen size={16} className="text-violet-600" /><h3 className="text-sm font-bold text-slate-800">Downstream Integration — Supply Chain → Vendor Management</h3></div>
-        <p className="text-xs text-slate-400 mb-4">This module consumes supplier and supply information passed downstream from the Supply Chain subsystem. Supplier sourcing, selection, and acquisition are performed upstream.</p>
-        <div className="flex flex-col lg:flex-row items-stretch gap-3">
-          {steps.map((s, i) => (
-            <React.Fragment key={s.t}>
-              {i > 0 && <div className="hidden lg:flex items-center"><ArrowLeft size={14} className="text-slate-300 -scale-x-100" /></div>}
-              <div className={`flex-1 rounded-xl border p-3 ${s.c}`}>
-                <p className="text-xs font-bold">{s.t}</p>
-                <p className="text-[11px] mt-0.5 opacity-80">{s.d}</p>
-              </div>
-            </React.Fragment>
-          ))}
-        </div>
-        <div className="mt-4 p-3 bg-slate-50 border border-slate-100 rounded-xl flex gap-2 text-[11px] text-slate-500"><Info size={13} className="shrink-0 mt-0.5" />Mock data is structured to receive supplier and supply records from the Supply Chain subsystem through an API — no sourcing workflow exists inside this module.</div>
-      </Card>
-
-      <Card className="p-5">
-        <div className="flex items-center gap-2 mb-4"><Users size={16} className="text-green-600" /><h3 className="text-sm font-bold text-slate-800">Receiving &amp; Monitoring Team</h3></div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-          {[
-            { n: "R. Dela Cruz", r: "Receiving Coordinator" },
-            { n: "K. Banag", r: "Warehouse Associate" },
-            { n: "J. Mercado", r: "Quality Check" },
-            { n: "Juan dela Cruz", r: "Module Administrator" },
-          ].map(p => (
-            <div key={p.n} className="rounded-xl border border-slate-200 p-3">
-              <div className="w-8 h-8 rounded-full bg-[#5b21b6]/10 text-[#5b21b6] font-bold flex items-center justify-center text-xs mb-2">{p.n.split(" ").map(x => x[0]).join("")}</div>
-              <p className="text-sm font-semibold text-slate-800">{p.n}</p>
-              <p className="text-[11px] text-slate-400">{p.r}</p>
-            </div>
-          ))}
-        </div>
-      </Card>
-    </div>
+      )}
+    </>,
+    document.getElementById("modal-portal") ?? document.body
   );
 };

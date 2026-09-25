@@ -3,18 +3,24 @@ import { pool } from "./db/pool.js";
 import {
   CONDITIONS,
   COUNT_UNITS,
+  DEFAULT_VENDOR_ID,
+  EVALUATION_CRITERIA,
   RECEIPT_STATUSES,
   REQUEST_PRIORITIES,
   REQUEST_STATUSES,
   REQUEST_STATUS_LABEL,
   SUPPLIER_STATUSES,
+  SUPPLIER_TYPES,
   SUPPLY_STATUSES,
   SUPPLY_STATUS_LABEL,
 } from "./db/constants.js";
 import {
   genNotifId,
   httpError,
+  mapApplication,
   mapArrival,
+  mapAuditLog,
+  mapEvaluation,
   mapNotification,
   mapProduct,
   mapReceipt,
@@ -22,6 +28,7 @@ import {
   mapSupplier,
   mapSupplyRequest,
   toDbDateTime,
+  toIso,
 } from "./util.js";
 import { logAudit } from "./audit.js";
 
@@ -166,8 +173,44 @@ async function loadReceipts(vendorId) {
   return rows.map((r) => mapReceipt(r, byReceipt.get(r.id) ?? []));
 }
 
-async function loadNotifications(vendorId) {
-  const [rows] = await pool.query("SELECT * FROM notifications WHERE vendor_id = ? ORDER BY created_at DESC", [vendorId]);
+/* Receiving history filtered by the actual stored received_at date.
+   The range is inclusive of the full From and To calendar days: a To date
+   is expanded by one day so records at any stored time that day are kept. */
+export async function fetchReceiptHistory(user, { fromDate, toDate } = {}) {
+  const vendorId = vendorIdOf(user);
+  const where = ["vendor_id = ?"];
+  const params = [vendorId];
+  if (fromDate) {
+    where.push("received_at >= ?");
+    params.push(`${fromDate} 00:00:00`);
+  }
+  if (toDate) {
+    where.push("received_at < DATE_ADD(?, INTERVAL 1 DAY)");
+    params.push(`${toDate} 00:00:00`);
+  }
+  const [rows] = await pool.query(`SELECT * FROM receipts WHERE ${where.join(" AND ")} ORDER BY received_at DESC`, params);
+  const ids = rows.map((r) => r.id);
+  let items = [];
+  if (ids.length > 0) {
+    const [itemRows] = await pool.query(
+      `SELECT * FROM receipt_items WHERE receipt_id IN (${ids.map(() => "?").join(",")}) ORDER BY id`,
+      ids
+    );
+    items = itemRows;
+  }
+  const byReceipt = new Map();
+  for (const i of items) {
+    if (!byReceipt.has(i.receipt_id)) byReceipt.set(i.receipt_id, []);
+    byReceipt.get(i.receipt_id).push(i);
+  }
+  return rows.map((r) => mapReceipt(r, byReceipt.get(r.id) ?? []));
+}
+
+async function loadNotifications(vendorId, role = "all") {
+  const [rows] = await pool.query(
+    "SELECT * FROM notifications WHERE vendor_id = ? AND (recipient = 'all' OR recipient = ?) ORDER BY created_at DESC",
+    [vendorId, role]
+  );
   return rows.map(mapNotification);
 }
 
@@ -247,15 +290,16 @@ export async function fetchSupplyRequestById(id, vendorId) {
 
 export async function fetchBootstrap(user) {
   const vendorId = vendorIdOf(user);
-  const [suppliers, arrivals, receipts, notifications, supplyRequests, products] = await Promise.all([
+  const [suppliers, arrivals, receipts, notifications, supplyRequests, products, applications] = await Promise.all([
     loadSuppliers(vendorId),
     loadArrivals(vendorId),
     loadReceipts(vendorId),
-    loadNotifications(vendorId),
+    loadNotifications(vendorId, user.role ?? "all"),
     loadSupplyRequests(vendorId),
     loadProducts(vendorId),
+    fetchApplications(user),
   ]);
-  return { suppliers, arrivals, receipts, notifications, supplyRequests, products };
+  return { suppliers, arrivals, receipts, notifications, supplyRequests, products, applications };
 }
 
 export async function fetchReceiptById(id, vendorId) {
@@ -307,8 +351,8 @@ async function syncArrivalStatus(conn, arrivalId) {
 
 async function createNotification(conn, notif) {
   await conn.query(
-    "INSERT INTO notifications (id, title, message, type, is_read, vendor_id, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)",
-    [genNotifId(), notif.title, notif.message, notif.type, notif.vendorId ?? "", toDbDateTime(new Date())]
+    "INSERT INTO notifications (id, title, message, type, is_read, vendor_id, recipient, created_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+    [genNotifId(), notif.title, notif.message, notif.type, notif.vendorId ?? "", notif.recipient ?? "all", toDbDateTime(new Date())]
   );
 }
 
@@ -425,6 +469,7 @@ export async function createReceipt(body, user) {
       message: `${sup[0].company_name} - ${data.totalQty} units received${data.arrivalId ? ` against ${data.arrivalId}` : ""} (${data.id}).`,
       type: data.items.some((i) => i.condition !== "good") ? "error" : "success",
       vendorId,
+      recipient: "all",
     });
 
     await logAudit({
@@ -501,6 +546,7 @@ export async function updateReceipt(id, body, user) {
       message: `${sup[0].company_name} - ${data.totalQty} units updated (${id}).`,
       type: data.items.some((i) => i.condition !== "good") ? "error" : "info",
       vendorId,
+      recipient: "all",
     });
 
     await logAudit({
@@ -573,6 +619,7 @@ export async function confirmReceipt(id, user) {
       message: `${row.supplier_name} - ${id} confirmed.`,
       type: items.some((i) => i.condition_value !== "good") ? "error" : "success",
       vendorId,
+      recipient: "all",
     });
 
     await logAudit({
@@ -610,6 +657,7 @@ export async function updateArrivalStatus(id, status, user) {
       message: `${rows[0].supplier_name} (${id}) moved to ${SUPPLY_STATUS_LABEL[status]}.`,
       type: status === "rejected_damaged" ? "error" : status === "completed" ? "success" : "info",
       vendorId,
+      recipient: "all",
     });
     await logAudit({
       conn,
@@ -648,18 +696,36 @@ export async function setSupplierStatus(id, status, user) {
 }
 
 export async function markNotificationRead(id, user) {
-  const [res] = await pool.query("UPDATE notifications SET is_read = 1 WHERE id = ? AND vendor_id = ?", [id, vendorIdOf(user)]);
+  const role = user.role ?? "all";
+  const [res] = await pool.query(
+    "UPDATE notifications SET is_read = 1 WHERE id = ? AND vendor_id = ? AND (recipient = 'all' OR recipient = ?)",
+    [id, vendorIdOf(user), role]
+  );
   if (res.affectedRows === 0) throw httpError(404, "Notification not found.");
-  return { ok: true };
+
+  const [rows] = await pool.query(
+    "SELECT * FROM notifications WHERE id = ? AND vendor_id = ?",
+    [id, vendorIdOf(user)]
+  );
+  if (rows.length === 0) throw httpError(404, "Notification not found.");
+  return mapNotification(rows[0]);
 }
 
 export async function markAllNotificationsRead(user) {
-  await pool.query("UPDATE notifications SET is_read = 1 WHERE vendor_id = ?", [vendorIdOf(user)]);
+  const role = user.role ?? "all";
+  await pool.query(
+    "UPDATE notifications SET is_read = 1 WHERE vendor_id = ? AND (recipient = 'all' OR recipient = ?)",
+    [vendorIdOf(user), role]
+  );
   return { ok: true };
 }
 
 export async function clearNotifications(user) {
-  await pool.query("DELETE FROM notifications WHERE vendor_id = ?", [vendorIdOf(user)]);
+  const role = user.role ?? "all";
+  await pool.query(
+    "DELETE FROM notifications WHERE vendor_id = ? AND (recipient = 'all' OR recipient = ?)",
+    [vendorIdOf(user), role]
+  );
   return { ok: true };
 }
 
@@ -895,6 +961,7 @@ export async function submitSupplyRequest(id, user) {
       message: `${id} has been submitted to the Supply Chain subsystem for review and sourcing.`,
       type: "info",
       vendorId,
+      recipient: "admin",
     });
     await logAudit({
       conn,
@@ -980,7 +1047,7 @@ export async function fetchDashboard(user) {
     loadSuppliers(vendorId),
     loadArrivals(vendorId),
     loadReceipts(vendorId),
-    loadNotifications(vendorId),
+    loadNotifications(vendorId, user.role ?? "all"),
   ]);
 
   const byStatus = arrivals.reduce((acc, a) => {
@@ -1145,4 +1212,674 @@ export async function deleteCompanyDocument(id, user) {
     ip: user?.ip ?? "",
   });
   return { ok: true };
+}
+
+/* ── supplier applications & sourcing workflow ─────────── */
+
+const pad5 = (n) => String(n).padStart(5, "0");
+
+async function nextApplicationReference(conn) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const year = new Date().getFullYear();
+    const [[{ c }]] = await conn.query(
+      "SELECT COUNT(*) AS c FROM supplier_applications WHERE id LIKE ?",
+      [`APP-${year}-%`]
+    );
+    const ref = `APP-${year}-${pad5(c + 1)}`;
+    const [collision] = await conn.query("SELECT id FROM supplier_applications WHERE id = ?", [ref]);
+    if (collision.length === 0) return ref;
+  }
+  throw httpError(409, "Could not generate a unique application reference. Please retry.");
+}
+
+async function nextSupplierReference(conn) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const year = new Date().getFullYear();
+    const [[{ c }]] = await conn.query(
+      "SELECT COUNT(*) AS c FROM suppliers WHERE id LIKE ?",
+      [`SUP-${year}-%`]
+    );
+    const ref = `SUP-${year}-${pad5(c + 1)}`;
+    const [collision] = await conn.query("SELECT id FROM suppliers WHERE id = ?", [ref]);
+    if (collision.length === 0) return ref;
+  }
+  throw httpError(409, "Could not generate a unique supplier reference. Please retry.");
+}
+
+export function validateSupplierApplicationPayload(body) {
+  const errors = {};
+  const s = (v, max) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+
+  const companyName = s(body.companyName, 180);
+  if (!companyName) errors.companyName = "Company name is required.";
+
+  const businessRegNo = s(body.businessRegNo, 80);
+  if (!businessRegNo) errors.businessRegNo = "Business registration number is required.";
+
+  const tin = s(body.tin, 60);
+  if (!tin) errors.tin = "TIN is required.";
+
+  const address = s(body.address, 255);
+  if (!address) errors.address = "Company address is required.";
+
+  const email = s(body.email, 160).toLowerCase();
+  if (!email) errors.email = "Email address is required.";
+  else if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) errors.email = "Enter a valid email address.";
+
+  const phone = s(body.phone, 60);
+  if (!phone) errors.phone = "Phone number is required.";
+
+  const website = s(body.website, 160);
+  const distributionArea = s(body.distributionArea, 255);
+  if (!distributionArea) errors.distributionArea = "Distribution area is required.";
+
+  const contactName = s(body.contactName, 120);
+  if (!contactName) errors.contactName = "Contact person is required.";
+
+  const contactPosition = s(body.contactPosition, 120);
+  if (!contactPosition) errors.contactPosition = "Contact position / title is required.";
+
+  const supplierType = s(body.supplierType, 30);
+  if (!SUPPLIER_TYPES.includes(supplierType)) errors.supplierType = "Select a valid supplier type.";
+
+  const yearsInBusiness =
+    body.yearsInBusiness === "" || body.yearsInBusiness === null || body.yearsInBusiness === undefined
+      ? null
+      : Number(body.yearsInBusiness);
+  if (
+    yearsInBusiness !== null &&
+    (!Number.isInteger(yearsInBusiness) || yearsInBusiness < 0 || yearsInBusiness > 200)
+  ) {
+    errors.yearsInBusiness = "Years in business must be a whole number from 0 to 200.";
+  }
+
+  const products = [];
+  if (!Array.isArray(body.products) || body.products.length === 0) {
+    errors.products = "Add at least one product / supply you can offer.";
+  } else if (body.products.length > 15) {
+    errors.products = "An application can list at most 15 products.";
+  } else {
+    for (let i = 0; i < body.products.length; i++) {
+      const raw = body.products[i] ?? {};
+      const name = s(raw.name, 180);
+      const category = s(raw.category, 60);
+      if (!name) { errors.products = `Product ${i + 1}: product name is required.`; break; }
+      if (!category) { errors.products = `Product ${i + 1}: select a category.`; break; }
+      products.push({
+        name,
+        category,
+        description: s(raw.description, 500),
+        brand: s(raw.brand, 160),
+        supplyCapacity: s(raw.supplyCapacity, 120),
+        minOrderQty: s(raw.minOrderQty, 120),
+        priceRange: s(raw.priceRange, 120),
+        unit: s(raw.unit, 20),
+      });
+    }
+  }
+
+  if (Object.keys(errors).length > 0) {
+    const keys = [
+      "companyName", "businessRegNo", "tin", "address", "email", "phone",
+      "distributionArea", "contactName", "contactPosition", "supplierType",
+      "yearsInBusiness", "products",
+    ];
+    const message = keys.map((k) => errors[k]).find(Boolean) ?? errors[Object.keys(errors)[0]];
+    throw httpError(400, message, { errors });
+  }
+
+  return {
+    companyName, businessRegNo, tin, address, email, phone, website,
+    distributionArea, contactName, contactPosition, supplierType, yearsInBusiness, products,
+  };
+}
+
+async function loadApplication(id) {
+  const [rows] = await pool.query("SELECT * FROM supplier_applications WHERE id = ?", [id]);
+  if (rows.length === 0) return null;
+  const [products] = await pool.query(
+    "SELECT * FROM application_products WHERE application_id = ? ORDER BY id", [id]
+  );
+  const [docs] = await pool.query(
+    "SELECT id, original_name, stored_name, mime_type, size_bytes, created_at FROM application_documents WHERE application_id = ? ORDER BY created_at, id",
+    [id]
+  );
+  const [timeline] = await pool.query(
+    "SELECT id, action, actor, note, created_at FROM application_timeline WHERE application_id = ? ORDER BY created_at, id",
+    [id]
+  );
+  return mapApplication(rows[0], {
+    products: products.map((p) => ({
+      name: p.name,
+      category: p.category,
+      description: p.description,
+      brand: p.brand,
+      supplyCapacity: p.supply_capacity,
+      minOrderQty: p.min_order_qty,
+      priceRange: p.price_range,
+      unit: p.unit,
+    })),
+    documents: docs.map((d) => ({
+      id: d.id,
+      originalName: d.original_name,
+      storedName: d.stored_name,
+      mimeType: d.mime_type,
+      sizeBytes: Number(d.size_bytes),
+      createdAt: toIso(d.created_at),
+    })),
+    timeline: timeline.map((t) => ({
+      id: t.id,
+      action: t.action,
+      actor: t.actor,
+      note: t.note,
+      date: toIso(t.created_at),
+    })),
+  });
+}
+
+async function insertApplicationFiles(conn, applicationId, files) {
+  for (const f of files) {
+    await conn.query(
+      "INSERT INTO application_documents (id, application_id, original_name, stored_name, mime_type, size_bytes) VALUES (?, ?, ?, ?, ?, ?)",
+      [randomUUID(), applicationId, f.originalName, f.storedName, f.mimeType, f.sizeBytes]
+    );
+  }
+}
+
+export async function createSupplierApplication(parsed, files, user = null) {
+  const vendorId = DEFAULT_VENDOR_ID;
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const id = await nextApplicationReference(conn);
+    await conn.query(
+      `INSERT INTO supplier_applications
+        (id, vendor_id, company_name, business_reg_no, tin, address, email, phone, website,
+         distribution_area, contact_name, contact_position, supplier_type, years_in_business,
+         status, submitted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', NOW())`,
+      [id, vendorId, parsed.companyName, parsed.businessRegNo, parsed.tin, parsed.address, parsed.email,
+        parsed.phone, parsed.website, parsed.distributionArea, parsed.contactName, parsed.contactPosition,
+        parsed.supplierType, parsed.yearsInBusiness]
+    );
+    for (const p of parsed.products) {
+      await conn.query(
+        `INSERT INTO application_products
+          (application_id, name, category, description, brand, supply_capacity, min_order_qty, price_range, unit)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, p.name, p.category, p.description, p.brand, p.supplyCapacity, p.minOrderQty, p.priceRange, p.unit]
+      );
+    }
+    await insertApplicationFiles(conn, id, files);
+    await conn.query(
+      "INSERT INTO application_timeline (application_id, action, actor, note, created_at) VALUES (?, ?, ?, ?, NOW())",
+      [id, "Application Submitted", parsed.contactName || parsed.companyName, `${parsed.companyName} submitted a supplier application.`]
+    );
+    await createNotification(conn, {
+      title: "New Supplier Application",
+      message: `${parsed.companyName} submitted a new supplier application (${id}).`,
+      type: "info",
+      vendorId,
+      recipient: "admin",
+    });
+    await logAudit({
+      conn,
+      user: user ?? { vendorId, sub: null },
+      action: "application.submit",
+      entityType: "supplier_application",
+      entityId: id,
+      detail: `Application received from ${parsed.companyName} (${parsed.products.length} product line(s), ${files.length} document(s)).`,
+      ip: user?.ip ?? "",
+    });
+    await conn.commit();
+    return loadApplication(id);
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+export async function lookupApplicationStatus(id, email) {
+  const [rows] = await pool.query(
+    "SELECT * FROM supplier_applications WHERE id = ? AND LOWER(email) = LOWER(?)",
+    [id, email ?? ""]
+  );
+  if (rows.length === 0) return null;
+  const app = await loadApplication(id);
+  if (!app) return null;
+  /* Public lookups only expose identity, status, notes, and the timeline. */
+  const { products, documents, ...rest } = app;
+  return rest;
+}
+
+export async function fetchApplications(user) {
+  const vendorId = vendorIdOf(user);
+  const [rows] = await pool.query(
+    "SELECT id FROM supplier_applications WHERE vendor_id = ? ORDER BY submitted_at DESC, id DESC",
+    [vendorId]
+  );
+  const out = [];
+  for (const { id } of rows) {
+    const app = await loadApplication(id);
+    if (app) out.push(app);
+  }
+  return out;
+}
+
+export async function fetchApplicationById(id, user) {
+  const [rows] = await pool.query("SELECT * FROM supplier_applications WHERE id = ?", [id]);
+  if (rows.length === 0) return null;
+  assertVendorScope(rows[0].vendor_id, user);
+  return loadApplication(id);
+}
+
+export async function fetchApplicationDocument(appId, docId, user) {
+  const [rows] = await pool.query("SELECT a.vendor_id FROM supplier_applications a WHERE a.id = ?", [appId]);
+  if (rows.length === 0) throw httpError(404, "Supplier application not found.");
+  assertVendorScope(rows[0].vendor_id, user);
+  const [docs] = await pool.query(
+    "SELECT * FROM application_documents WHERE id = ? AND application_id = ?",
+    [docId, appId]
+  );
+  if (docs.length === 0) throw httpError(404, "Document not found.");
+  return docs[0];
+}
+
+async function runApplicationTransition(id, user, fn) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [rows] = await conn.query("SELECT * FROM supplier_applications WHERE id = ?", [id]);
+    if (rows.length === 0) throw httpError(404, "Supplier application not found.");
+    assertVendorScope(rows[0].vendor_id, user);
+    await fn(conn, rows[0]);
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+function timelineEntry(conn, applicationId, action, actor, note) {
+  return conn.query(
+    "INSERT INTO application_timeline (application_id, action, actor, note, created_at) VALUES (?, ?, ?, ?, NOW())",
+    [applicationId, action, actor, note]
+  );
+}
+
+export async function setApplicationUnderReview(id, user) {
+  await runApplicationTransition(id, user, async (conn, row) => {
+    if (row.status !== "pending_review") {
+      throw httpError(409, "Only pending applications can be moved to under review.");
+    }
+    await conn.query("UPDATE supplier_applications SET status = 'under_review' WHERE id = ?", [id]);
+    await timelineEntry(conn, id, "Status Changed to Under Review", user?.username ?? "Admin", "Application is now under review.");
+    await createNotification(conn, {
+      title: "Application Under Review",
+      message: `${row.company_name} (${id}) is now under review.`,
+      type: "info",
+      vendorId: row.vendor_id,
+      recipient: "admin",
+    });
+    await logAudit({
+      conn, user,
+      action: "application.under_review",
+      entityType: "supplier_application",
+      entityId: id,
+      detail: `Moved ${id} (${row.company_name}) to Under Review.`,
+      ip: user?.ip ?? "",
+    });
+  });
+  return fetchApplicationById(id, user);
+}
+
+export async function rejectApplication(id, reason, user) {
+  const note = typeof reason === "string" ? reason.trim().slice(0, 1000) : "";
+  if (!note) throw httpError(400, "A rejection reason is required.");
+  await runApplicationTransition(id, user, async (conn, row) => {
+    if (row.status === "approved") throw httpError(409, "This application is already approved.");
+    if (row.status === "rejected") throw httpError(409, "This application was already rejected.");
+    await conn.query(
+      "UPDATE supplier_applications SET status = 'rejected', rejection_reason = ? WHERE id = ?",
+      [note, id]
+    );
+    await timelineEntry(conn, id, "Application Rejected", user?.username ?? "Admin", note);
+    await createNotification(conn, {
+      title: "Application Rejected",
+      message: `${row.company_name} (${id}) has been rejected.`,
+      type: "error",
+      vendorId: row.vendor_id,
+      recipient: "admin",
+    });
+    await logAudit({
+      conn, user,
+      action: "application.reject",
+      entityType: "supplier_application",
+      entityId: id,
+      detail: `Rejected ${id}: ${note}`,
+      ip: user?.ip ?? "",
+    });
+  });
+  return fetchApplicationById(id, user);
+}
+
+export async function requestApplicationRevision(id, note, user) {
+  const text = typeof note === "string" ? note.trim().slice(0, 1000) : "";
+  if (!text) throw httpError(400, "A revision note is required.");
+  await runApplicationTransition(id, user, async (conn, row) => {
+    if (row.status === "approved") throw httpError(409, "This application is already approved.");
+    if (row.status === "revision_required") throw httpError(409, "This application already requires revision.");
+    await conn.query(
+      "UPDATE supplier_applications SET status = 'revision_required', revision_note = ? WHERE id = ?",
+      [text, id]
+    );
+    await timelineEntry(conn, id, "Revision Required", user?.username ?? "Admin", text);
+    await createNotification(conn, {
+      title: "Revision Required",
+      message: `${row.company_name} (${id}) has been asked to revise and resubmit.`,
+      type: "warning",
+      vendorId: row.vendor_id,
+      recipient: "admin",
+    });
+    await logAudit({
+      conn, user,
+      action: "application.revision",
+      entityType: "supplier_application",
+      entityId: id,
+      detail: `Revision required for ${id}: ${text}`,
+      ip: user?.ip ?? "",
+    });
+  });
+  return fetchApplicationById(id, user);
+}
+
+export async function approveApplication(id, user) {
+  const vendorId = vendorIdOf(user);
+  let supplierId = "";
+  await runApplicationTransition(id, user, async (conn, row) => {
+    if (row.status === "approved") throw httpError(409, "This application is already approved.");
+    if (row.status === "rejected") throw httpError(409, "A rejected application can no longer be approved.");
+    supplierId = await nextSupplierReference(conn);
+    const app = await loadApplication(id);
+    await conn.query(
+      `INSERT INTO suppliers
+        (id, source_ref, vendor_id, company_name, contact_name, contact_email, contact_phone,
+         supplier_type, address, email, phone, website, distribution_area, status, established_on,
+         source_application_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', CURDATE(), ?)`,
+      [supplierId, id, row.vendor_id, row.company_name, row.contact_name, row.email, row.phone,
+        row.supplier_type, row.address, row.email, row.phone, row.website ?? "",
+        row.distribution_area ?? "", id]
+    );
+    for (const p of app.products) {
+      await conn.query(
+        "INSERT INTO supplier_products (supplier_id, name, description, brand, category) VALUES (?, ?, ?, ?, ?)",
+        [supplierId, p.name, p.description, p.brand, p.category]
+      );
+    }
+    await conn.query(
+      "UPDATE supplier_applications SET status = 'approved', approved_supplier_id = ?, revision_note = '', rejection_reason = '' WHERE id = ?",
+      [supplierId, id]
+    );
+    await timelineEntry(
+      conn, id, "Application Approved", user?.username ?? "Admin",
+      `All requirements met. Supplier ID ${supplierId} generated and added to Supplier Management.`
+    );
+    await createNotification(conn, {
+      title: "Supplier Approved",
+      message: `${row.company_name} approved as an official Tri-M supplier (${supplierId}).`,
+      type: "success",
+      vendorId: row.vendor_id,
+      recipient: "admin",
+    });
+    await logAudit({
+      conn, user,
+      action: "application.approve",
+      entityType: "supplier_application",
+      entityId: id,
+      detail: `Application approved. Supplier record created: ${supplierId}.`,
+      ip: user?.ip ?? "",
+    });
+    await logAudit({
+      conn,
+      user: { sub: null, vendorId: row.vendor_id },
+      action: "supplier.create",
+      entityType: "supplier",
+      entityId: supplierId,
+      detail: `Official supplier record auto-generated from application ${id}.`,
+      ip: "",
+    });
+    });
+  return fetchSupplierById(supplierId, vendorId);
+}
+
+export async function resubmitSupplierApplication(id, email, parsed, files, user = null) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [rows] = await pool.query(
+      "SELECT * FROM supplier_applications WHERE id = ? AND LOWER(email) = LOWER(?)",
+      [id, email ?? ""]
+    );
+    if (rows.length === 0) throw httpError(404, "Application not found. Check your Application ID and email.");
+    const row = rows[0];
+    if (row.status !== "revision_required") {
+      throw httpError(409, "This application is not open for resubmission.");
+    }
+    await conn.query("DELETE FROM application_products WHERE application_id = ?", [id]);
+    await conn.query("DELETE FROM application_documents WHERE application_id = ?", [id]);
+    await conn.query(
+      `UPDATE supplier_applications
+        SET company_name = ?, business_reg_no = ?, tin = ?, address = ?, email = ?, phone = ?,
+            website = ?, distribution_area = ?, contact_name = ?, contact_position = ?,
+            supplier_type = ?, years_in_business = ?, status = 'pending_review', revision_note = ''
+       WHERE id = ?`,
+      [parsed.companyName, parsed.businessRegNo, parsed.tin, parsed.address, parsed.email, parsed.phone,
+        parsed.website, parsed.distributionArea, parsed.contactName, parsed.contactPosition,
+        parsed.supplierType, parsed.yearsInBusiness, id]
+    );
+    for (const p of parsed.products) {
+      await conn.query(
+        `INSERT INTO application_products
+          (application_id, name, category, description, brand, supply_capacity, min_order_qty, price_range, unit)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, p.name, p.category, p.description, p.brand, p.supplyCapacity, p.minOrderQty, p.priceRange, p.unit]
+      );
+    }
+    await insertApplicationFiles(conn, id, files);
+    await timelineEntry(conn, id, "Application Resubmitted", parsed.contactName || parsed.companyName, "Revised application submitted for review.");
+    await createNotification(conn, {
+      title: "Application Resubmitted",
+      message: `${parsed.companyName} has resubmitted application ${id} for review.`,
+      type: "info",
+      vendorId: row.vendor_id,
+      recipient: "admin",
+    });
+    await logAudit({
+      conn,
+      user: user ?? { vendorId: row.vendor_id, sub: null },
+      action: "application.resubmit",
+      entityType: "supplier_application",
+      entityId: id,
+      detail: `Application ${id} resubmitted after revision (${parsed.products.length} product line(s), ${files.length} document(s)).`,
+      ip: user?.ip ?? "",
+    });
+    await conn.commit();
+    return loadApplication(id);
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/* ── evaluations & performance ─────────────────────────── */
+
+export async function fetchEvaluations(user) {
+  const vendorId = vendorIdOf(user);
+  const [rows] = await pool.query(
+    `SELECT e.*, s.company_name AS supplier_name
+     FROM evaluations e
+     JOIN suppliers s ON s.id = e.supplier_id
+     WHERE s.vendor_id = ?
+     ORDER BY e.created_at DESC, e.id DESC`,
+    [vendorId]
+  );
+  const seen = new Set();
+  const out = [];
+  for (const row of rows) {
+    if (seen.has(row.supplier_id)) continue;
+    seen.add(row.supplier_id);
+    const [criteria] = await pool.query(
+      "SELECT criterion, label, weight, score FROM evaluation_criteria WHERE evaluation_id = ? ORDER BY id",
+      [row.id]
+    );
+    out.push(mapEvaluation(row, criteria));
+  }
+  return out;
+}
+
+export async function saveEvaluation({ supplierId, comment, scores }, user) {
+  const vendorId = vendorIdOf(user);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [rows] = await pool.query(
+      "SELECT id, company_name FROM suppliers WHERE id = ? AND vendor_id = ?",
+      [supplierId, vendorId]
+    );
+    if (rows.length === 0) throw httpError(403, "Unknown or unauthorized supplier reference.");
+    const cleaned = EVALUATION_CRITERIA.map((c) => {
+      const value = Number(scores?.[c.key]);
+      const score = Number.isFinite(value) ? Math.min(100, Math.max(0, Math.round(value))) : 0;
+      return { ...c, score };
+    });
+    const [res] = await conn.query(
+      "INSERT INTO evaluations (supplier_id, evaluator_id, comment) VALUES (?, ?, ?)",
+      [supplierId, user?.sub ?? null, typeof comment === "string" ? comment.trim().slice(0, 1000) : ""]
+    );
+    const evaluationId = res.insertId;
+    for (const c of cleaned) {
+      await conn.query(
+        "INSERT INTO evaluation_criteria (evaluation_id, criterion, label, weight, score) VALUES (?, ?, ?, ?, ?)",
+        [evaluationId, c.key, c.label, c.weight, c.score]
+      );
+    }
+    const total = cleaned.reduce((a, c) => a + (c.weight * c.score) / 100, 0);
+    const totalRounded = Math.round(total * 100) / 100;
+    await conn.query(
+      "UPDATE suppliers SET evaluation_score = ?, performance_rating = ?, last_evaluated = NOW() WHERE id = ?",
+      [totalRounded, Math.round((totalRounded / 10) * 10) / 10, supplierId]
+    );
+    await createNotification(conn, {
+      title: "Supplier Evaluation Saved",
+      message: `${rows[0].company_name} evaluated (score ${totalRounded}/100).`,
+      type: "success",
+      vendorId,
+      recipient: "admin",
+    });
+    await logAudit({
+      conn, user,
+      action: "evaluation.save",
+      entityType: "evaluation",
+      entityId: String(evaluationId),
+      detail: `Evaluated ${rows[0].company_name} (${supplierId}): ${totalRounded}/100.`,
+      ip: user?.ip ?? "",
+    });
+    await conn.commit();
+    return { ok: true, id: evaluationId, supplierId, total: totalRounded };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/* Performance metrics are DERIVED from real receiving data plus the latest
+   evaluation — never guessed or hardcoded. */
+export async function fetchPerformance(user) {
+  const vendorId = vendorIdOf(user);
+  const [rows] = await pool.query(
+    `SELECT s.id, s.company_name, s.supplier_type, s.status, s.evaluation_score,
+            s.performance_rating, s.last_evaluated
+     FROM suppliers s WHERE s.vendor_id = ? ORDER BY s.company_name`,
+    [vendorId]
+  );
+  const [receiptAgg] = await pool.query(
+    `SELECT supplier_id,
+            COUNT(*) AS receipt_count,
+            COALESCE(SUM(total_qty), 0) AS total_received,
+            COALESCE(SUM(CASE WHEN condition_value <> 'good' THEN qty ELSE 0 END), 0) AS issue_qty
+     FROM receipts r
+     LEFT JOIN receipt_items ri ON ri.receipt_id = r.id
+     WHERE r.vendor_id = ?
+     GROUP BY supplier_id`,
+    [vendorId]
+  );
+  const bySupplier = new Map(receiptAgg.map((r) => [r.supplier_id, r]));
+  const [history] = await pool.query(
+    `SELECT e.supplier_id, s.evaluation_score AS latest
+     FROM evaluations e
+     JOIN suppliers s ON s.id = e.supplier_id
+     WHERE s.vendor_id = ? AND e.id IN (SELECT MAX(id) FROM evaluations GROUP BY supplier_id)`,
+    [vendorId]
+  );
+  const prevBest = new Map();
+  for (const h of history) {
+    const [prev] = await pool.query(
+      "SELECT e.id FROM evaluations e WHERE e.supplier_id = ? AND e.id < (SELECT MAX(id) FROM evaluations e2 WHERE e2.supplier_id = e.supplier_id) ORDER BY e.id DESC LIMIT 1",
+      [h.supplier_id]
+    );
+    if (prev.length > 0) {
+      const [[agg]] = await pool.query(
+        "SELECT SUM(weight * score) / 100 AS total FROM evaluation_criteria WHERE evaluation_id = ?",
+        [prev[0].id]
+      );
+      prevBest.set(h.supplier_id, Number(agg?.total ?? 0));
+    }
+  }
+  return rows.map((s) => {
+    const agg = bySupplier.get(s.id);
+    const totalReceived = Number(agg?.total_received ?? 0);
+    const issueQty = Number(agg?.issue_qty ?? 0);
+    const issueRate = totalReceived > 0 ? Math.round((issueQty / totalReceived) * 1000) / 10 : 0;
+    const evalScore = s.evaluation_score == null ? 0 : Number(s.evaluation_score);
+    const prev = prevBest.get(s.id);
+    const trend = prev !== undefined && prev > 0 ? Math.round((evalScore - prev) * 10) / 10 : null;
+    return {
+      id: s.id,
+      companyName: s.company_name,
+      supplierType: s.supplier_type,
+      status: s.status,
+      receiptCount: Number(agg?.receipt_count ?? 0),
+      totalReceived,
+      issueRate,
+      issueQty,
+      evaluationScore: evalScore,
+      performanceRating: s.performance_rating == null ? 0 : Number(s.performance_rating),
+      lastEvaluated: s.last_evaluated ? toIso(s.last_evaluated) : "",
+      trend,
+    };
+  });
+}
+
+export async function fetchAuditLogs(user) {
+  const vendorId = vendorIdOf(user);
+  const [rows] = await pool.query(
+    `SELECT al.id, al.user_id, al.action, al.entity_type, al.entity_id, al.detail, al.created_at,
+            u.username AS actor_name
+     FROM audit_logs al
+     LEFT JOIN users u ON u.id = al.user_id
+     WHERE al.vendor_id = ?
+     ORDER BY al.created_at DESC, al.id DESC
+     LIMIT 500`,
+    [vendorId]
+  );
+  return rows.map(mapAuditLog);
 }

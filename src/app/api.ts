@@ -23,16 +23,6 @@ export interface BootstrapData {
   products: Product[];
 }
 
-export interface CompanyProfile {
-  id: string;
-  companyName: string;
-  contactName: string;
-  contactEmail: string;
-  contactPhone: string;
-  address: string;
-  isActive: boolean;
-}
-
 export interface LoginResult {
   token: string;
   user: {
@@ -78,6 +68,25 @@ export function clearToken(): void {
     localStorage.removeItem(SESSION_KEY);
   } catch {
     /* ignore */
+  }
+}
+
+export function setSessionUser(user: LoginResult["user"] | null): void {
+  try {
+    if (user) localStorage.setItem(SESSION_KEY, JSON.stringify(user));
+    else localStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+export function getSessionUser(): LoginResult["user"] | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as LoginResult["user"];
+  } catch {
+    return null;
   }
 }
 
@@ -128,6 +137,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ username, password }),
     }),
+
+  me: () => request<{ user: LoginResult["user"] }>("/auth/me"),
 
   logout: () =>
     request<{ ok: boolean }>("/auth/logout", {
@@ -196,5 +207,31 @@ export const api = {
       method: "POST",
     }),
 
-  getCompanyProfile: () => request<CompanyProfile>("/vendor/company"),
+  receivingHistory: (params: { from?: string; to?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.from) q.set("from", params.from);
+    if (params.to) q.set("to", params.to);
+    const qs = q.toString();
+    return request<SupplyReceipt[]>(`/vendor/receiving/history${qs ? `?${qs}` : ""}`);
+  },
+
+  verifyReceivingReportPassword: (password: string) =>
+    request<{ ok: boolean; grant: string }>("/vendor/receiving/report/verify", {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    }),
+
+  generateReceivingReport: (grant: string, params: { from?: string; to?: string } = {}) => {
+    const body: { grant: string; from?: string; to?: string } = { grant };
+    if (params.from) body.from = params.from;
+    if (params.to) body.to = params.to;
+    return request<{ ok: boolean; filename: string; pdfBase64: string }>("/vendor/receiving/report", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+
+  /* Slide the server-side 30-minute inactivity window (Stay Logged In / active
+     heartbeat). The backend enforces the same window on every /api/vendor call. */
+  touchSession: () => request<{ ok: boolean; expiresAt?: string }>("/vendor/session/touch", { method: "POST" }),
 };

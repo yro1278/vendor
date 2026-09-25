@@ -4,7 +4,7 @@ import { getToken } from "./api";
 const DRAFT_PREFIX = "trim_vendor_draft_";
 const PAGE_KEY = "trim_vendor_current_page";
 
-export type DraftType = "request" | "receiving" | "company";
+export type DraftType = "request" | "receiving";
 
 function getUserScopedKey(type: DraftType, extraId?: string): string {
   const token = getToken();

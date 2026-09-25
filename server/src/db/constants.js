@@ -40,7 +40,17 @@ export const DEFAULT_VENDOR = {
   address: "Blk. 1A Lot 14, Verde Heights Subd., Brgy. Gaya-Gaya, City of San Jose del Monte, Bulacan",
 };
 
-export const ALLOWED_VENDOR_ROLES = ["admin", "vendor"];
+/* Vendor Management roles. "admin" manages suppliers, evaluation,
+   performance, applications, reporting and overall administration.
+   "receiving_staff" is the dock/operations user who records incoming
+   supplies, verifies quantities/condition, and confirms receipt. */
+export const SYSTEM_ROLES = ["admin", "receiving_staff"];
+export const ALLOWED_VENDOR_ROLES = SYSTEM_ROLES;
+
+export const ROLE_LABEL = {
+  admin: "Admin",
+  receiving_staff: "Receiving Staff",
+};
 
 export const REQUEST_STATUSES = [
   "draft",
@@ -87,4 +97,38 @@ export const SUPPLY_STATUS_LABEL = {
   partially_received: "Partially Received",
   completed: "Completed",
   rejected_damaged: "Rejected / Damaged",
+};
+
+/* Public supplier-sourcing workflow statuses. Applications start at
+   pending_review; approval materializes a suppliers row. */
+export const APPLICATION_STATUSES = [
+  "pending_review",
+  "under_review",
+  "revision_required",
+  "approved",
+  "rejected",
+];
+
+export const APPLICATION_STATUS_LABEL = {
+  pending_review: "Pending Review",
+  under_review: "Under Review",
+  revision_required: "Revision Required",
+  approved: "Approved",
+  rejected: "Rejected",
+};
+
+/* Fixed evaluation criteria weights (sum to 100). Per-criterion scores are
+   0–100 in evaluation_criteria; the weighted total is persisted to suppliers. */
+export const EVALUATION_CRITERIA = [
+  { key: "quality", label: "Product Quality", weight: 30 },
+  { key: "delivery", label: "Delivery Reliability", weight: 25 },
+  { key: "pricing", label: "Pricing Competitiveness", weight: 20 },
+  { key: "communication", label: "Communication", weight: 15 },
+  { key: "compliance", label: "Compliance & Documentation", weight: 10 },
+];
+
+export const APPLICATION_DOC_MIME = {
+  "application/pdf": [".pdf"],
+  "image/png": [".png"],
+  "image/jpeg": [".jpg", ".jpeg"],
 };

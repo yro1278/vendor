@@ -35,6 +35,18 @@ export async function requireAuth(req, _res, next) {
   }
 }
 
+/* Route-level role gate. Must run after requireVendor so req.user.role is
+   populated from the database (never from JWT claims). Passing one or more
+   allowed role values authorizes the route. */
+export function requireRole(...roles) {
+  return (req, _res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return next(httpError(403, "You do not have permission to access this feature."));
+    }
+    return next();
+  };
+}
+
 /* Registers a new server-side session (sliding inactivity window).
    Call once right after a successful sign-in. */
 export async function createSession({ jti, userId, vendorId }) {
