@@ -275,7 +275,7 @@ receivingHistory: (params: { from?: string; to?: string } = {}) => {
       body: JSON.stringify(input),
     }),
 
-  /* Slide the server-side 30-minute inactivity window (Stay Logged In / active
+  /* Slide the server-side inactivity window (Stay Logged In / active
      heartbeat). The backend enforces the same window on every /api/vendor call. */
   touchSession: () => request<{ ok: boolean; expiresAt?: string }>("/vendor/session/touch", { method: "POST" }),
 };

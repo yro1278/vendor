@@ -66,7 +66,7 @@ router.get(
 router.post(
   "/session/touch",
   asyncHandler(async (req, res) => {
-    /* requireVendor already slides the 30-minute inactivity window on every
+    /* requireVendor already slides the inactivity window on every
        /api/vendor request, so this lightweight route is what a UI-side
        "Stay Logged In" / activity heartbeat calls to extend the server
        session without touching any data. */

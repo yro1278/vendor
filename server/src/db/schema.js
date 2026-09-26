@@ -59,9 +59,10 @@ const TABLES = [
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
   /* Server-side inactivity tracking for Vendor Management sessions.
-     A session is created at login and its sliding window (30 minutes)
-     is bumped on every protected vendor request; once the window lapses
-     the token is revoked and further access is denied with 401. */
+     A session is created at login and its sliding window (see
+     config.session.timeoutMinutes) is bumped on every protected vendor
+     request; once the window lapses the token is revoked and further
+     access is denied with 401. */
   `CREATE TABLE IF NOT EXISTS sessions (
     jti VARCHAR(64) NOT NULL PRIMARY KEY,
     user_id INT NULL,

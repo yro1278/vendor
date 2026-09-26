@@ -1,5 +1,5 @@
 import { Dispatch, SetStateAction, useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, clearToken } from "./api";
+import { api, ApiError, clearToken, getSessionUser } from "./api";
 
 /* ─────────────────────────────────────────────────────────
    TRI-M GLOBAL LOGISTICS & TRADING INC.
@@ -462,8 +462,6 @@ export function useVendorData(): {
     setSessionExpired(false);
     try {
       const boot = await api.bootstrap();
-      const counts = await api.supplyRequestCounts();
-      const vrh = await api.receivingVendorHistory();
       const s = settersRef.current;
       s.setSuppliers(boot.suppliers);
       s.setArrivals(boot.arrivals);
@@ -472,8 +470,24 @@ export function useVendorData(): {
       s.setSupplyRequests(boot.supplyRequests);
       s.setProducts(boot.products);
       s.setVendorReceivings(boot.vendorReceivings ?? []);
-      s.setSupplyRequestCounts(counts);
-      s.setVendorReceivingHistory(vrh);
+
+      /* Supply-request status counts only feed the Request Supply badges, and
+         that page is admin-only. The endpoint is role-gated server-side, so a
+         receiving_staff user gets 403 for it — asking anyway would throw out
+         of this whole try block and leave the module permanently unable to
+         load. Admins fetch it; everyone else gets an empty map. A failure here
+         is never fatal to the rest of the load either way. */
+      if (getSessionUser()?.role === "admin") {
+        try {
+          s.setSupplyRequestCounts(await api.supplyRequestCounts());
+        } catch {
+          s.setSupplyRequestCounts({});
+        }
+      } else {
+        s.setSupplyRequestCounts({});
+      }
+
+      s.setVendorReceivingHistory(await api.receivingVendorHistory());
       setError(null);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {

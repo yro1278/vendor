@@ -10,6 +10,7 @@
     "dev": "node --watch --env-file-if-exists=.env src/index.js",
     "start": "node --env-file-if-exists=.env src/index.js",
     "setup": "node --env-file-if-exists=.env src/setup.js",
+    "seed:data": "node --env-file-if-exists=.env src/seed-data.js",
     "test": "node test/validate-receipt.test.mjs && node test/validate-request.test.mjs",
     "test:integration": "node test/api-integration.test.mjs"
   },

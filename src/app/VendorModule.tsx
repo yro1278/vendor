@@ -441,11 +441,12 @@ const NAV: { icon: React.ReactNode; label: string; page: Page; roles: readonly S
 ];
 
 /* Idle session timeout: the server (auth.js requireVendor) expires the session
-   after 30 minutes of inactivity and slides the window on every /api/vendor
-   request. The UI mirrors it — warn 5 minutes before (25 min), expire at 30 min. */
-const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
-const IDLE_WARN_MS = 25 * 60 * 1000;
-const IDLE_HEARTBEAT_MS = 5 * 60 * 1000;
+   after 5 minutes of inactivity and slides the window on every /api/vendor
+   request. The UI mirrors it — warn 1 minute before (4 min), expire at 5 min.
+   These MUST stay in step with config.session.timeoutMinutes on the server. */
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const IDLE_WARN_MS = 4 * 60 * 1000;
+const IDLE_HEARTBEAT_MS = 60 * 1000;
 
 type Props = {
   role: SystemRole;
@@ -464,14 +465,15 @@ export default function VendorManagement(props: Props) {
   const [collapsed, setCollapsed] = React.useState(false);
   const [receivingPreset, setReceivingPreset] = React.useState<ReceivingPreset | null>(null);
   const [historyPreset, setHistoryPreset] = React.useState<HistoryPreset | null>(null);
+  const [requestFilterPreset, setRequestFilterPreset] = React.useState<RequestFilterKey | null>(null);
   const [notifOpen, setNotifOpen] = React.useState(false);
   const [logoutConfirm, setLogoutConfirm] = React.useState(false);
   const bellRef = React.useRef<HTMLButtonElement | null>(null);
 
   /* ── Idle session timeout (mirrors the server-side sliding window) ──
-     The backend already expires the session after 30 minutes without any
+     The backend already expires the session after 5 minutes without any
      /api/vendor request (auth.js requireVendor). This UI layer matches that
-     window: it warns 5 minutes before the timeout and, on "Stay Logged In",
+     window: it warns 1 minute before the timeout and, on "Stay Logged In",
      calls the server so the real session (not just the local timer) extends. */
   const [sessionWarnOpen, setSessionWarnOpen] = React.useState(false);
   const [sessionWarnErr, setSessionWarnErr] = React.useState("");
@@ -578,6 +580,12 @@ export default function VendorManagement(props: Props) {
     window.scrollTo({ top: 0 });
   };
 
+  const openRequests = (preset: RequestFilterKey | null) => {
+    setRequestFilterPreset(preset);
+    setPage("request");
+    window.scrollTo({ top: 0 });
+  };
+
   const Sidebar = ({ mobile = false }: { mobile?: boolean }) => {
     const isCollapsed = mobile ? false : collapsed;
     return (
@@ -590,7 +598,7 @@ export default function VendorManagement(props: Props) {
         </div>
         <nav className={isCollapsed ? "flex-1 py-2 px-2 space-y-1" : "flex-1 overflow-y-auto py-2 px-3 space-y-1"}>
           {navItems.map(({ icon, label, page: p }) => (
-            <button key={p} onClick={() => { setPage(p); setMobileOpen(false); if (p === "receiving") setReceivingPreset(null); if (p === "history") setHistoryPreset(null); }}
+            <button key={p} onClick={() => { setPage(p); setMobileOpen(false); if (p === "receiving") setReceivingPreset(null); if (p === "history") setHistoryPreset(null); if (p === "request") setRequestFilterPreset(null); }}
               className={`group relative w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all text-left ${isCollapsed ? "justify-center" : ""} ${currentPage === p ? "bg-violet-500/20 text-white" : "text-slate-300 hover:text-white hover:bg-white/5"}`}>
               {icon}
               {!isCollapsed && <span className="flex-1 truncate">{label}</span>}
@@ -657,10 +665,10 @@ export default function VendorManagement(props: Props) {
                 </div>
               )}
               <div key={currentPage} className="page-enter mx-auto max-w-[1440px]">
-                {currentPage === "dashboard" && <Dashboard role={role} data={data} goTo={toNext} actions={actions} onOpenReceiving={openReceiving} onOpenHistory={openHistory} />}
+                {currentPage === "dashboard" && <Dashboard role={role} data={data} goTo={toNext} actions={actions} onOpenReceiving={openReceiving} onOpenHistory={openHistory} onOpenRequests={openRequests} />}
                 {currentPage === "receiving" && <Receiving data={data} actions={actions} goTo={toNext} preset={receivingPreset} onPresetConsumed={() => setReceivingPreset(null)} />}
                 {currentPage === "monitor" && <SupplyMonitoring data={data} actions={actions} goTo={toNext} />}
-                {currentPage === "request" && <RequestSupply data={data} actions={actions} goTo={toNext} />}
+                {currentPage === "request" && <RequestSupply data={data} actions={actions} goTo={toNext} preset={requestFilterPreset} onPresetConsumed={() => setRequestFilterPreset(null)} />}
                 {currentPage === "suppliers" && <Suppliers data={data} actions={actions} />}
                 {currentPage === "history" && <ReceivingHistory data={data} actions={actions} preset={historyPreset} onPresetConsumed={() => setHistoryPreset(null)} />}
               </div>
@@ -683,11 +691,12 @@ export default function VendorManagement(props: Props) {
 
 /* ── dashboard ─────────────────────────────────────────── */
 
-const Dashboard = ({ role, data, goTo, actions, onOpenReceiving, onOpenHistory }: {
+const Dashboard = ({ role, data, goTo, actions, onOpenReceiving, onOpenHistory, onOpenRequests }: {
   role: string; data: VendorData; goTo: (p: Page) => void;
   actions: VendorActions;
   onOpenReceiving: (preset: ReceivingPreset | null) => void;
   onOpenHistory: (preset: HistoryPreset | null) => void;
+  onOpenRequests: (preset: RequestFilterKey | null) => void;
 }) => {
   const { arrivals, receipts, suppliers, supplyRequests } = data;
   const [viewingRec, setViewingRec] = React.useState<SupplyReceipt | null>(null);
@@ -697,10 +706,14 @@ const Dashboard = ({ role, data, goTo, actions, onOpenReceiving, onOpenHistory }
   const partial = count("partially_received");
   const completed = count("completed");
 
-  const pendingRequests = supplyRequests.filter(r => ["submitted", "under_review", "approved", "processing", "fulfillment_in_progress"].includes(r.status)).length;
-  const underReview = supplyRequests.filter(r => r.status === "under_review").length;
-  const fulfilledRequests = supplyRequests.filter(r => r.status === "fulfilled").length;
-  const partialRequests = supplyRequests.filter(r => r.status === "partially_fulfilled").length;
+  /* Each request tile counts the SAME status group it navigates to, so the
+     number on the tile can never disagree with the list it opens. */
+  const countRequests = (key: Exclude<RequestFilterKey, "all">) =>
+    supplyRequests.filter(r => REQUEST_FILTER_GROUPS[key].includes(r.status)).length;
+  const pendingRequests = countRequests("active");
+  const underReview = countRequests("under_review");
+  const fulfilledRequests = countRequests("fulfilled");
+  const partialRequests = countRequests("partially_fulfilled");
 
   const recentReceipts = [...receipts].sort((a, b) => +new Date(b.receivedAt) - +new Date(a.receivedAt)).slice(0, 5);
   const recentNotifs = data.notifications.slice(0, 4);
@@ -734,10 +747,10 @@ const Dashboard = ({ role, data, goTo, actions, onOpenReceiving, onOpenHistory }
 
       {role === "admin" && (
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          <KpiCard icon={<ClipboardPlus size={18} className="text-violet-600" />} label="Requests In Progress" value={pendingRequests} sub="Submitted → Fulfillment" color="bg-violet-50" />
-          <KpiCard icon={<Clock size={18} className="text-amber-600" />} label="Under Review" value={underReview} sub="With Supply Chain" color="bg-amber-50" />
-          <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Fulfilled" value={partialRequests} sub="Balance pending" color="bg-orange-50" />
-          <KpiCard icon={<CheckCircle2 size={18} className="text-green-600" />} label="Requests Fulfilled" value={fulfilledRequests} sub="Fully delivered" color="bg-green-50" />
+          <KpiCard icon={<ClipboardPlus size={18} className="text-violet-600" />} label="Requests In Progress" value={pendingRequests} sub="Submitted → Fulfillment" color="bg-violet-50" onClick={() => onOpenRequests("active")} />
+          <KpiCard icon={<Clock size={18} className="text-amber-600" />} label="Under Review" value={underReview} sub="With Supply Chain" color="bg-amber-50" onClick={() => onOpenRequests("under_review")} />
+          <KpiCard icon={<RefreshCw size={18} className="text-orange-600" />} label="Partially Fulfilled" value={partialRequests} sub="Balance pending" color="bg-orange-50" onClick={() => onOpenRequests("partially_fulfilled")} />
+          <KpiCard icon={<CheckCircle2 size={18} className="text-green-600" />} label="Requests Fulfilled" value={fulfilledRequests} sub="Fully delivered" color="bg-green-50" onClick={() => onOpenRequests("fulfilled")} />
         </div>
       )}
 
@@ -1170,9 +1183,13 @@ const RequestDetail = ({ request, onClose, onEdit, actions }: {
    granular status set (draft/submitted/under_review/approved/processing/
    fulfillment_in_progress/partially_fulfilled/fulfilled/rejected/cancelled);
    the UI groups related statuses into a shorter, workflow-focused list. */
-type RequestFilterKey = "all" | "draft" | "under_review" | "approved" | "in_progress" | "partially_fulfilled" | "fulfilled" | "rejected" | "cancelled";
+type RequestFilterKey = "all" | "active" | "draft" | "under_review" | "approved" | "in_progress" | "partially_fulfilled" | "fulfilled" | "rejected" | "cancelled";
 
 const REQUEST_FILTER_GROUPS: Record<Exclude<RequestFilterKey, "all">, SupplyRequestStatus[]> = {
+  /* "active" is the dashboard's Requests-In-Progress tile. It has no chip of its
+     own — it is a deep-link target so that tile and the list it opens can never
+     disagree on what "in progress" means. */
+  active: ["submitted", "under_review", "approved", "processing", "fulfillment_in_progress"],
   draft: ["draft"],
   under_review: ["submitted", "under_review"],
   approved: ["approved"],
@@ -1197,13 +1214,40 @@ const REQUEST_MORE_FILTERS: { key: Exclude<RequestFilterKey, "all">; label: stri
   { key: "cancelled", label: "Cancelled" },
 ];
 
-const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: VendorActions; goTo: (p: Page) => void }) => {
-  const [filter, setFilter] = React.useState<RequestFilterKey>("all");
+/* Label for every filter key, including "active" which has no chip but is
+   reachable by deep link from the dashboard tile. */
+const REQUEST_FILTER_LABEL: Record<RequestFilterKey, string> = {
+  all: "All",
+  active: "In Progress",
+  draft: "Draft",
+  under_review: "Under Review",
+  approved: "Approved",
+  in_progress: "In Progress",
+  partially_fulfilled: "Partially Fulfilled",
+  fulfilled: "Fulfilled",
+  rejected: "Rejected",
+  cancelled: "Cancelled",
+};
+
+const RequestSupply = ({ data, actions, goTo, preset, onPresetConsumed }: {
+  data: VendorData; actions: VendorActions; goTo: (p: Page) => void;
+  preset?: RequestFilterKey | null; onPresetConsumed?: () => void;
+}) => {
+  const [filter, setFilter] = React.useState<RequestFilterKey>(preset ?? "all");
+  const [presetLocal, setPresetLocal] = React.useState<RequestFilterKey | null>(preset ?? null);
   const [moreOpen, setMoreOpen] = React.useState(false);
   const [q, setQ] = React.useState("");
   const [formOpen, setFormOpen] = React.useState(false);
   const [editing, setEditing] = React.useState<SupplyRequest | null>(null);
   const [viewing, setViewing] = React.useState<SupplyRequest | null>(null);
+
+  const clearPreset = () => { setPresetLocal(null); onPresetConsumed?.(); };
+
+  const applyFilter = (next: RequestFilterKey) => {
+    setFilter(next);
+    setPresetLocal(next === "all" ? null : next);
+    onPresetConsumed?.();
+  };
 
   const filtered = data.supplyRequests.filter(r => {
     const matchF = filter === "all" || REQUEST_FILTER_GROUPS[filter].includes(r.status);
@@ -1233,10 +1277,17 @@ const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: Ven
           <input className={`${inp} pl-9`} placeholder="Search request ref, reason, or product…" value={q} onChange={e => setQ(e.target.value)} />
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <button onClick={() => { setFilter("all"); setMoreOpen(false); }} className={pill(filter === "all")}>All ({filterCount("all")})</button>
+          <button onClick={() => { applyFilter("all"); setMoreOpen(false); }} className={pill(filter === "all")}>All ({filterCount("all")})</button>
           {REQUEST_PRIMARY_FILTERS.map(f => (
-            <button key={f.key} onClick={() => { setFilter(f.key); setMoreOpen(false); }} className={pill(filter === f.key)}>{f.label} ({filterCount(f.key)})</button>
+            <button key={f.key} onClick={() => { applyFilter(f.key); setMoreOpen(false); }} className={pill(filter === f.key)}>{f.label} ({filterCount(f.key)})</button>
           ))}
+          {/* A deep link from a dashboard tile stays visible as a removable chip
+              so it is always obvious why the list is narrowed. */}
+          {presetLocal && !REQUEST_PRIMARY_FILTERS.some(f => f.key === presetLocal) && (
+            <button type="button" onClick={clearPreset} title="Show all requests" className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-violet-700 bg-violet-50 border border-violet-200 rounded-full px-2.5 py-1.5 hover:bg-violet-100 transition-colors cursor-pointer">
+              {REQUEST_FILTER_LABEL[presetLocal]} from Dashboard <X size={12} />
+            </button>
+          )}
           <div className="relative">
             <button onClick={() => setMoreOpen(o => !o)} aria-haspopup="menu" aria-expanded={moreOpen} className={`${pill(moreActive)} inline-flex items-center gap-1`}>More <ChevronDown size={13} className={`transition-transform ${moreOpen ? "rotate-180" : ""}`} /></button>
             {moreOpen && (
@@ -1244,7 +1295,7 @@ const RequestSupply = ({ data, actions, goTo }: { data: VendorData; actions: Ven
                 <div className="fixed inset-0 z-20" onClick={() => setMoreOpen(false)} />
                 <div role="menu" className="absolute right-0 top-full mt-2 z-30 min-w-[170px] rounded-xl border border-slate-200 bg-white p-1 shadow-lg">
                   {REQUEST_MORE_FILTERS.map(f => (
-                    <button key={f.key} role="menuitem" onClick={() => { setFilter(f.key); setMoreOpen(false); }} className={`block w-full text-left px-3 py-2 text-xs font-semibold rounded-lg transition-colors ${filter === f.key ? "bg-violet-50 text-violet-700" : "text-slate-600 hover:bg-slate-50"}`}>{f.label} ({filterCount(f.key)})</button>
+                    <button key={f.key} role="menuitem" onClick={() => { applyFilter(f.key); setMoreOpen(false); }} className={`block w-full text-left px-3 py-2 text-xs font-semibold rounded-lg transition-colors ${filter === f.key ? "bg-violet-50 text-violet-700" : "text-slate-600 hover:bg-slate-50"}`}>{f.label} ({filterCount(f.key)})</button>
                   ))}
                 </div>
               </>

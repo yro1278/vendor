@@ -21,11 +21,12 @@ export const config = {
     expiresIn: process.env.JWT_EXPIRES_IN || "12h",
   },
   session: {
-    /* Vendor Management session idle timeout — EXACTLY 30 minutes of
+    /* Vendor Management session idle timeout — EXACTLY 5 minutes of
        inactivity. Enforced on the backend for every protected vendor API
        call via the sessions table (sliding window; the token is revoked
-       the moment the timeout lapses). */
-    timeoutMinutes: 30,
+       the moment the timeout lapses). The UI mirrors this window in
+       src/app/VendorModule.tsx (IDLE_TIMEOUT_MS). */
+    timeoutMinutes: 5,
   },
   autoMigrate: String(process.env.AUTO_MIGRATE ?? "true") !== "false",
 };

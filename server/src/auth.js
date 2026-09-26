@@ -78,7 +78,7 @@ export async function revokeSession(payload) {
    - the user role must be allowed vendor access (else 403)
    - the user must belong to a vendor account (else 403)
    - the vendor account must be active (else 403)
-   - the server-side session must be within its 30-minute inactivity window
+   - the server-side session must be within its inactivity window
      (else the token is revoked and the request gets 401)
 
    req.user is rebuilt FROM THE DATABASE every request so role/vendor changes
@@ -88,9 +88,10 @@ export async function requireVendor(req, _res, next) {
     const payload = req.tokenPayload;
     if (!payload || !payload.sub) throw httpError(401, "Unauthorized.");
 
-    /* 30-minute inactivity enforcement (sliding window). A protected vendor
-       request only succeeds while the session keeps getting bumped; when the
-       window lapses the token is revoked and every later call is denied. */
+    /* Inactivity enforcement (sliding window, config.session.timeoutMinutes).
+       A protected vendor request only succeeds while the session keeps getting
+       bumped; when the window lapses the token is revoked and every later call
+       is denied. */
     if (payload.jti) {
       const [res] = await pool.query(
         `UPDATE sessions
